@@ -16,7 +16,9 @@ messages配列には過去の会話履歴が含まれています。
 利用可能なチャンネル:
 ${channelList}`;
 
-const TOOLS = [
+const WEB_SEARCH_ENABLED = process.env.WEB_SEARCH_ENABLED !== 'false';
+
+const DISCORD_TOOLS = [
   {
     type: 'function',
     function: {
@@ -107,6 +109,9 @@ const TOOLS = [
       },
     },
   },
+];
+
+const WEB_TOOLS_DEFS = [
   {
     type: 'function',
     function: {
@@ -136,6 +141,10 @@ const TOOLS = [
     },
   },
 ];
+
+const TOOLS = WEB_SEARCH_ENABLED
+  ? [...DISCORD_TOOLS, ...WEB_TOOLS_DEFS]
+  : DISCORD_TOOLS;
 
 const WINDOWS_API = `http://${process.env.WINDOWS_API_HOST || 'localhost'}:7654`;
 
