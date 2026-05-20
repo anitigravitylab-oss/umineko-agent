@@ -1,0 +1,57 @@
+const API_URL = 'https://api.deepseek.com/chat/completions';
+
+const SYSTEM = `あなたはDiscordサーバーのAIアシスタントのプランナーです。
+ユーザーの指示を実行するための計画を立ててください。
+
+- 情報収集が必要な場合のみ channels に読むべきチャンネル名を列挙する
+- チャンネルの作成・送信・編集など書き込み系の指示で読む必要がなければ channels は空配列にする
+- approach には一文で実行方針を書く
+
+必ず以下のJSON形式のみで返してください:
+{"channels":["channel-name"],"approach":"一文で実行方針"}
+情報収集不要な例: {"channels":[],"approach":"指定チャンネルにメッセージを送信する"}`;
+
+export async function planSearch(userMessage, channelList, history = []) {
+  const recentHistory = history.slice(-10);
+  const historyText = recentHistory.length > 0
+    ? '## 直近の会話履歴\n' +
+      recentHistory.map((m) => `${m.role === 'user' ? 'ユーザー' : 'AI'}: ${m.content}`).join('\n') +
+      '\n\n'
+    : '';
+
+  try {
+    const res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [
+          { role: 'system', content: SYSTEM },
+          { role: 'user', content: `${historyText}## 利用可能なチャンネル\n${channelList}\n\n## 今回の指示\n${userMessage}` },
+        ],
+        max_tokens: 300,
+      }),
+    });
+
+    if (!res.ok) throw new Error(`API error ${res.status}`);
+    const data = await res.json();
+    const raw = data.choices[0].message.content ?? '';
+
+    const channelsMatch = raw.match(/"channels"\s*:\s*\[([^\]]*)\]/);
+    const channels = channelsMatch
+      ? [...channelsMatch[1].matchAll(/"([^"]+)"/g)].map((m) => m[1])
+      : [];
+
+    const approachMatch = raw.match(/"approach"\s*:\s*"([^"]+)"/);
+    const approach = approachMatch?.[1] ?? '';
+
+    console.log(`[planner] channels=[${channels.join(', ')}] approach=${approach}`);
+    return { channels, approach };
+  } catch (e) {
+    console.warn(`[planner] failed: ${e.message}`);
+    return { channels: [], approach: '' };
+  }
+}

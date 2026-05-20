@@ -1,0 +1,80 @@
+const API_URL = 'https://api.deepseek.com/chat/completions';
+
+const SYSTEM = `あなたはDiscordチャットボットの回答整形・品質チェック担当です。
+以下の作業を行ってください:
+
+1. 【整形】以下を除去・修正する
+   - ツール呼び出しの生マークアップ（<｜｜DSML｜｜...> など）
+   - 「念のため確認します」「ツールで〜しました」などの内部処理への言及
+   - 「おっしゃる通り、前回の回答では〜」のような不自然な謝罪前置き
+   - ユーザーには関係ない作業ログ的な記述
+
+2. 【品質チェック】整形後の回答がユーザーの指示・質問に対して適切か判定する
+   - 実際にアクションを実行した場合: 結果を明確に伝えているか
+   - 質問の場合: 具体的な情報で答えているか
+   - 「わかりません」「確認できません」だけで終わっている場合は ok=false
+
+必ず以下のJSON形式のみで返してください:
+{"ok":true,"answer":"整形済みの最終回答"}
+または
+{"ok":false,"feedback":"問題点と改善指示"}`;
+
+export async function finalizeResponse(userMessage, rawAnswer, history = []) {
+  const cleaned = rawAnswer?.trim() ?? '';
+
+  if (!cleaned) {
+    return { ok: false, feedback: '回答が空です。ユーザーの指示に対して適切な回答を生成してください。' };
+  }
+
+  try {
+    const res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [
+          { role: 'system', content: SYSTEM },
+          {
+            role: 'user',
+            content: [
+              history.length > 0
+                ? '## 直近の会話履歴\n' +
+                  history.slice(-10).map((m) => `${m.role === 'user' ? 'ユーザー' : 'AI'}: ${m.content}`).join('\n')
+                : null,
+              `## 今回のユーザーの指示\n${userMessage}`,
+              `## 回答\n${cleaned}`,
+            ].filter(Boolean).join('\n\n'),
+          },
+        ],
+        max_tokens: 2000,
+      }),
+    });
+
+    if (!res.ok) throw new Error(`API error ${res.status}`);
+    const data = await res.json();
+    const raw = data.choices[0].message.content ?? '';
+
+    const okMatch = raw.match(/"ok"\s*:\s*(true|false)/);
+    const ok = okMatch?.[1] !== 'false';
+
+    if (ok) {
+      const answerMatch = raw.match(/"answer"\s*:\s*"([\s\S]+?)"\s*[,}]/);
+      // JSON全体をパースして answer を取得
+      try {
+        const parsed = JSON.parse(raw);
+        return { ok: true, answer: parsed.answer ?? cleaned };
+      } catch {
+        return { ok: true, answer: cleaned };
+      }
+    } else {
+      const feedbackMatch = raw.match(/"feedback"\s*:\s*"([^"]+)"/);
+      return { ok: false, feedback: feedbackMatch?.[1] ?? '回答が不十分です' };
+    }
+  } catch (e) {
+    console.warn(`[finalizer] failed: ${e.message}`);
+    return { ok: true, answer: cleaned };
+  }
+}
