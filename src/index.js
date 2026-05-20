@@ -153,7 +153,7 @@ client.on(Events.MessageCreate, async (message) => {
         await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[AI]** 処理中...']));
       };
 
-      let { answer, msgs: contextMsgs, webUsed } = await chatWithTools(msgs, {
+      let { answer, msgs: contextMsgs } = await chatWithTools(msgs, {
         guild: message.guild,
         aiChannelId,
         onToolCall,

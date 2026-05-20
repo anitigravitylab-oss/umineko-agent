@@ -333,11 +333,10 @@ export async function chatSimple(messages) {
   return data.choices[0].message.content;
 }
 
-// complex 用（ツール呼び出しループ）- { answer, msgs, webUsed } を返す
+// complex 用（ツール呼び出しループ）- { answer, msgs } を返す
 export async function chatWithTools(messages, { guild, aiChannelId, onToolCall }) {
   const msgs = [...messages];
   let iterations = 0;
-  let webUsed = false;
 
   while (iterations < MAX_TOOL_CALLS) {
     const data = await callAPI(msgs, { model: 'deepseek-v4-flash', tools: TOOLS });
@@ -348,7 +347,6 @@ export async function chatWithTools(messages, { guild, aiChannelId, onToolCall }
 
       const toolResults = await Promise.all(
         choice.message.tool_calls.map(async (tc) => {
-          if (WEB_TOOLS.has(tc.function.name)) webUsed = true;
           const args = JSON.parse(tc.function.arguments);
           const result = await executeTool(tc.function.name, args, guild, aiChannelId);
           await onToolCall(toolLabel(tc.function.name, args, result));
@@ -365,15 +363,15 @@ export async function chatWithTools(messages, { guild, aiChannelId, onToolCall }
       if (!content || !content.trim()) {
         msgs.push({ role: 'user', content: 'ツールの実行結果を踏まえて、ユーザーへの回答を生成してください。' });
         const followUp = await callAPI(msgs, { model: 'deepseek-v4-flash' });
-        return { answer: followUp.choices[0].message.content, msgs, webUsed };
+        return { answer: followUp.choices[0].message.content, msgs };
       }
-      return { answer: content, msgs, webUsed };
+      return { answer: content, msgs };
     }
   }
 
   msgs.push({ role: 'user', content: '収集した情報をもとに、最初の質問に答えてください。' });
   const data = await callAPI(msgs, { model: 'deepseek-v4-flash' });
-  return { answer: data.choices[0].message.content, msgs, webUsed };
+  return { answer: data.choices[0].message.content, msgs };
 }
 
 // リトライ用：既存の会話コンテキストで最終回答を再生成
