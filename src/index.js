@@ -117,6 +117,13 @@ client.on(Events.MessageCreate, async (message) => {
   const statusMsg = await message.reply('> ⏳ **[Router]** 判定中...');
   const statusLines = [];
 
+  const now = message.createdAt.toLocaleString('ja-JP', {
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', weekday: 'short',
+  });
+  const timeContext = `現在時刻: ${now} (JST)`;
+
   try {
     // ── Step 1: ルーティング判定 ──────────────────────────
     const serverInfo = buildServerInfo(message.guild);
@@ -167,7 +174,7 @@ client.on(Events.MessageCreate, async (message) => {
       await statusMsg.edit(formatStatus(statusLines));
 
       const msgs = [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: `${timeContext}\n\n${systemPrompt}` },
         ...history,
         { role: 'user', content: message.content },
       ];
@@ -225,7 +232,7 @@ client.on(Events.MessageCreate, async (message) => {
       await statusMsg.edit(formatStatus(statusLines));
 
       const msgs = [
-        { role: 'system', content: SYSTEM_SIMPLE },
+        { role: 'system', content: `${timeContext}\n\n${SYSTEM_SIMPLE}` },
         ...history,
         { role: 'user', content: message.content },
       ];
