@@ -15,6 +15,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -141,7 +142,7 @@ client.on(Events.MessageCreate, async (message) => {
         (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );
       const channelList = textChannels
-        .map((c) => `#${c.name}${c.topic ? ` (${c.topic})` : ''}`)
+        .map((c) => `#${c.name} [ID:${c.id}]${c.topic ? ` (${c.topic})` : ''}`)
         .join('\n');
 
       // ── Step 3: Plan ──────────────────────────────────────

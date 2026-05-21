@@ -16,6 +16,13 @@ messages配列には過去の会話履歴が含まれています。
 【重要】新しいAIチャットスペース（会話用チャンネル）を作成する場合は、チャンネル名を必ず "ai-" で始めること（例: ai-general, ai-work）。
 "ai-" で始まるチャンネルは自動的にAIチャットチャンネルとして認識され、そこでもAIと会話できるようになる。
 
+【Discordのフォーマットルール】
+- ユーザーメンション: <@数字ID> ← 必ず数字ID。<@ユーザー名> は機能しない
+- チャンネルリンク: <#チャンネルID> ← クリッカブルになる。チャンネルIDは下記リストに記載
+- メッセージリンク: https://discord.com/channels/{サーバーID}/{チャンネルID}/{メッセージID}
+- ロールメンション: <@&ロールID>
+- ユーザー/チャンネルのIDは必ずツール結果か下記リストから取得すること。推測・捏造禁止
+
 利用可能なチャンネル:
 ${channelList}`;
 
@@ -157,6 +164,46 @@ const DISCORD_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'fetch_message',
+      description: 'Discordのメッセージリンク（https://discord.com/channels/...）からメッセージ内容を取得する',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Discordメッセージリンク（チャンネルリンクも可）' },
+        },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_members',
+      description: 'Discordサーバーのメンバー一覧を取得する。メンション用のIDも含む',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'find_member',
+      description: '名前（表示名・ユーザー名）でメンバーを検索し、メンション文字列（<@ID>）を返す',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '検索するメンバー名（部分一致）' },
+        },
+        required: ['name'],
+      },
+    },
+  },
 ];
 
 const WEB_TOOLS_DEFS = [
@@ -248,7 +295,7 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
       const lines = [...fetched.values()]
         .reverse()
         .filter((m) => m.content.trim())
-        .map((m) => `[${m.id}] ${m.author.username}: ${m.content}`)
+        .map((m) => `[${m.id}] ${m.author.username}(メンション:<@${m.author.id}>): ${m.content}`)
         .join('\n');
       return lines || '(メッセージなし)';
     }
@@ -380,6 +427,61 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
       }
     }
 
+    case 'fetch_message': {
+      const match = args.url.match(/channels\/(\d+)\/(\d+)(?:\/(\d+))?/);
+      if (!match) return 'URLの形式が正しくありません。discord.com/channels/... の形式で指定してください。';
+      const [, , channelId, messageId] = match;
+      const channel = guild.channels.cache.get(channelId);
+      if (!channel) return `チャンネルID ${channelId} が見つかりませんでした。`;
+      if (!messageId) {
+        const fetched = await channel.messages.fetch({ limit: 20 });
+        const lines = [...fetched.values()]
+          .reverse()
+          .filter((m) => m.content.trim())
+          .map((m) => `[${m.id}] ${m.author.username}(メンション:<@${m.author.id}>): ${m.content}`)
+          .join('\n');
+        return `#${channel.name} の最近のメッセージ:\n${lines || '(メッセージなし)'}`;
+      }
+      try {
+        const msg = await channel.messages.fetch(messageId);
+        return `チャンネル: #${channel.name}\n送信者: ${msg.author.username}(メンション:<@${msg.author.id}>)\n内容: ${msg.content}\nリンク: https://discord.com/channels/${guild.id}/${channelId}/${messageId}`;
+      } catch (e) {
+        return `メッセージ取得失敗: ${e.message}`;
+      }
+    }
+
+    case 'list_members': {
+      try {
+        await guild.members.fetch();
+      } catch {
+        // GuildMembers intent が無い場合はキャッシュのみで続行
+      }
+      const members = guild.members.cache
+        .filter((m) => !m.user.bot)
+        .map((m) => `${m.displayName}(@${m.user.username}) メンション:<@${m.user.id}>`)
+        .join('\n');
+      return members || 'メンバーが見つかりませんでした。';
+    }
+
+    case 'find_member': {
+      try {
+        await guild.members.fetch();
+      } catch {
+        // GuildMembers intent が無い場合はキャッシュのみで続行
+      }
+      const query = args.name.toLowerCase();
+      const found = guild.members.cache.filter(
+        (m) =>
+          !m.user.bot &&
+          (m.displayName.toLowerCase().includes(query) ||
+            m.user.username.toLowerCase().includes(query))
+      );
+      if (found.size === 0) return `"${args.name}" に一致するメンバーが見つかりませんでした。`;
+      return found
+        .map((m) => `${m.displayName}(@${m.user.username}) メンション:<@${m.user.id}>`)
+        .join('\n');
+    }
+
     case 'search_web': {
       try {
         const res = await fetch(
@@ -438,6 +540,14 @@ function toolLabel(name, args, result) {
       return `\`edit_category("${args.category_name}")\` → "${args.new_name}" に変更`;
     case 'delete_category':
       return `\`delete_category("${args.category_name}")\` → 削除完了`;
+    case 'fetch_message':
+      return `\`fetch_message("${args.url.slice(0, 60)}...")\` → 取得完了`;
+    case 'list_members': {
+      const count = result.split('\n').filter(Boolean).length;
+      return `\`list_members()\` → ${count}人`;
+    }
+    case 'find_member':
+      return `\`find_member("${args.name}")\` → ${result.split('\n').length}件`;
     case 'search_web':
       return `\`search_web("${args.query}")\``;
     case 'fetch_url':
