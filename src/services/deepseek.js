@@ -268,7 +268,7 @@ async function executeToolInner(name, args, guild, aiChannelId) {
       try {
         const res = await fetch(
           `${WINDOWS_API}/search?q=${encodeURIComponent(args.query)}`,
-          { signal: AbortSignal.timeout(30000) }
+          { signal: AbortSignal.timeout(20000) }
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const { results } = await res.json();
@@ -285,7 +285,7 @@ async function executeToolInner(name, args, guild, aiChannelId) {
       try {
         const res = await fetch(
           `${WINDOWS_API}/fetch?url=${encodeURIComponent(args.url)}`,
-          { signal: AbortSignal.timeout(30000) }
+          { signal: AbortSignal.timeout(20000) }
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const { text } = await res.json();
