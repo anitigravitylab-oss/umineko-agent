@@ -152,17 +152,29 @@ async function callAPI(messages, { model, tools } = {}) {
   const body = { model, messages, max_tokens: 4096 };
   if (tools) body.tools = tools;
 
-  const res = await fetch(API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const MAX_RETRIES = 4;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify(body),
+    });
 
-  if (!res.ok) throw new Error(`DeepSeek API error ${res.status}: ${await res.text()}`);
-  return res.json();
+    if (res.status === 503) {
+      const wait = attempt * 10000; // 10s, 20s, 30s, 40s
+      console.warn(`[deepseek] 503 on attempt ${attempt}, retrying in ${wait / 1000}s...`);
+      if (attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, wait));
+        continue;
+      }
+    }
+
+    if (!res.ok) throw new Error(`DeepSeek API error ${res.status}: ${await res.text()}`);
+    return res.json();
+  }
 }
 
 async function executeTool(name, args, guild, aiChannelId) {
