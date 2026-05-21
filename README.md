@@ -1,5 +1,7 @@
 # Discord AI Bot
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/anitigravitylab-oss/umineko-agent)
+
 [日本語](#discord-ai-bot-ja) | [English](#discord-ai-bot-en)
 
 ---
