@@ -61,6 +61,7 @@ const DISCORD_TOOLS = [
         properties: {
           channel_name: { type: 'string', description: 'チャンネル名（英数字とハイフン）' },
           topic: { type: 'string', description: 'チャンネルの説明（省略可）' },
+          category: { type: 'string', description: '所属させるカテゴリ名（省略可）' },
         },
         required: ['channel_name'],
       },
@@ -70,15 +71,59 @@ const DISCORD_TOOLS = [
     type: 'function',
     function: {
       name: 'edit_channel',
-      description: 'Discordの既存チャンネルを編集する（名前・トピック変更）',
+      description: 'Discordの既存チャンネルを編集する（名前・トピック・カテゴリ変更）',
       parameters: {
         type: 'object',
         properties: {
           channel_name: { type: 'string', description: '編集対象のチャンネル名' },
           new_name: { type: 'string', description: '新しいチャンネル名（省略可）' },
           topic: { type: 'string', description: '新しいトピック（省略可）' },
+          category: { type: 'string', description: '移動先のカテゴリ名。空文字でカテゴリなしに（省略可）' },
         },
         required: ['channel_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'create_category',
+      description: 'Discordに新しいカテゴリを作成する',
+      parameters: {
+        type: 'object',
+        properties: {
+          category_name: { type: 'string', description: 'カテゴリ名' },
+        },
+        required: ['category_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'edit_category',
+      description: 'Discordの既存カテゴリを編集する（名前変更）',
+      parameters: {
+        type: 'object',
+        properties: {
+          category_name: { type: 'string', description: '編集対象のカテゴリ名' },
+          new_name: { type: 'string', description: '新しいカテゴリ名' },
+        },
+        required: ['category_name', 'new_name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'delete_category',
+      description: 'Discordの指定カテゴリを削除する（中のチャンネルはカテゴリなしになる）',
+      parameters: {
+        type: 'object',
+        properties: {
+          category_name: { type: 'string', description: '削除するカテゴリ名' },
+        },
+        required: ['category_name'],
       },
     },
   },
@@ -229,8 +274,14 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
       try {
         const options = { name: args.channel_name, type: ChannelType.GuildText };
         if (args.topic) options.topic = args.topic;
+        if (args.category) {
+          const cat = guild.channels.cache.find(
+            (c) => c.name === args.category && c.type === ChannelType.GuildCategory
+          );
+          if (cat) options.parent = cat.id;
+        }
         await guild.channels.create(options);
-        return `チャンネル #${args.channel_name} を作成しました。`;
+        return `チャンネル #${args.channel_name} を作成しました。${args.category ? `（カテゴリ: ${args.category}）` : ''}`;
       } catch (e) {
         return `作成失敗: ${e.message}`;
       }
@@ -245,10 +296,60 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
         const options = {};
         if (args.new_name) options.name = args.new_name;
         if (args.topic !== undefined) options.topic = args.topic;
+        if (args.category !== undefined) {
+          if (args.category === '') {
+            options.parent = null;
+          } else {
+            const cat = guild.channels.cache.find(
+              (c) => c.name === args.category && c.type === ChannelType.GuildCategory
+            );
+            if (!cat) return `カテゴリ "${args.category}" が見つかりませんでした。`;
+            options.parent = cat.id;
+          }
+        }
         await channel.edit(options);
         return `#${args.channel_name} を更新しました。`;
       } catch (e) {
         return `編集失敗: ${e.message}`;
+      }
+    }
+
+    case 'create_category': {
+      const existing = guild.channels.cache.find(
+        (c) => c.name === args.category_name && c.type === ChannelType.GuildCategory
+      );
+      if (existing) return `カテゴリ "${args.category_name}" はすでに存在します。`;
+      try {
+        await guild.channels.create({ name: args.category_name, type: ChannelType.GuildCategory });
+        return `カテゴリ "${args.category_name}" を作成しました。`;
+      } catch (e) {
+        return `作成失敗: ${e.message}`;
+      }
+    }
+
+    case 'edit_category': {
+      const cat = guild.channels.cache.find(
+        (c) => c.name === args.category_name && c.type === ChannelType.GuildCategory
+      );
+      if (!cat) return `カテゴリ "${args.category_name}" が見つかりませんでした。`;
+      try {
+        await cat.edit({ name: args.new_name });
+        return `カテゴリ "${args.category_name}" を "${args.new_name}" に変更しました。`;
+      } catch (e) {
+        return `編集失敗: ${e.message}`;
+      }
+    }
+
+    case 'delete_category': {
+      const cat = guild.channels.cache.find(
+        (c) => c.name === args.category_name && c.type === ChannelType.GuildCategory
+      );
+      if (!cat) return `カテゴリ "${args.category_name}" が見つかりませんでした。`;
+      try {
+        await cat.delete();
+        return `カテゴリ "${args.category_name}" を削除しました。（チャンネルはカテゴリなしになります）`;
+      } catch (e) {
+        return `削除失敗: ${e.message}`;
       }
     }
 
@@ -331,6 +432,12 @@ function toolLabel(name, args, result) {
       return `\`edit_message("${args.channel_name}", ${args.message_id})\` → 編集完了`;
     case 'delete_channel':
       return `\`delete_channel("${args.channel_name}")\` → 削除完了`;
+    case 'create_category':
+      return `\`create_category("${args.category_name}")\` → 作成完了`;
+    case 'edit_category':
+      return `\`edit_category("${args.category_name}")\` → "${args.new_name}" に変更`;
+    case 'delete_category':
+      return `\`delete_category("${args.category_name}")\` → 削除完了`;
     case 'search_web':
       return `\`search_web("${args.query}")\``;
     case 'fetch_url':
