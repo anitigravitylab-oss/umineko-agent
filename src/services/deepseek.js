@@ -148,9 +148,6 @@ const TOOLS = WEB_SEARCH_ENABLED
 
 const WINDOWS_API = `http://${process.env.WINDOWS_API_HOST || 'localhost'}:7654`;
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
-const GEMINI_FALLBACK_MODEL = 'gemini-2.5-flash';
-
 async function callAPI(messages, { model, tools } = {}) {
   const body = { model, messages, max_tokens: 4096 };
   if (tools) body.tools = tools;
@@ -173,31 +170,11 @@ async function callAPI(messages, { model, tools } = {}) {
         await new Promise((r) => setTimeout(r, wait));
         continue;
       }
-      // 全リトライ失敗 → Gemini にフォールバック
-      console.warn('[deepseek] all retries failed, falling back to Gemini');
-      return callGemini(messages, tools);
     }
 
     if (!res.ok) throw new Error(`DeepSeek API error ${res.status}: ${await res.text()}`);
     return res.json();
   }
-}
-
-async function callGemini(messages, tools) {
-  const body = { model: GEMINI_FALLBACK_MODEL, messages, max_tokens: 4096 };
-  if (tools) body.tools = tools;
-
-  const res = await fetch(GEMINI_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.GEMINI_API_KEY}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) throw new Error(`Gemini fallback error ${res.status}: ${await res.text()}`);
-  return res.json();
 }
 
 async function executeTool(name, args, guild, aiChannelId) {
