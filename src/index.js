@@ -18,13 +18,41 @@ const client = new Client({
   ],
 });
 
-const AI_CHANNEL_NAME = process.env.AI_CHANNEL_NAME || 'ai-chat';
-let aiChannelId = null;
+// ai- で始まるチャンネルをすべてAIチャットチャンネルとして扱う
+const AI_CHANNEL_PREFIX = process.env.AI_CHANNEL_PREFIX || 'ai-';
+const aiChannelIds = new Set();
+
+function isAiChatChannel(channel) {
+  return channel.type === ChannelType.GuildText && channel.name.startsWith(AI_CHANNEL_PREFIX);
+}
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`Ready! Logged in as ${c.user.tag}`);
   for (const [, guild] of c.guilds.cache) {
-    await ensureAiChannel(guild);
+    // 既存の ai-* チャンネルをすべて登録
+    for (const [, channel] of guild.channels.cache) {
+      if (isAiChatChannel(channel)) {
+        aiChannelIds.add(channel.id);
+        console.log(`AI channel registered: #${channel.name} (${channel.id})`);
+      }
+    }
+    await ensureDefaultChannel(guild);
+  }
+});
+
+// ai-* チャンネルが新規作成されたら自動登録
+client.on(Events.ChannelCreate, (channel) => {
+  if (isAiChatChannel(channel)) {
+    aiChannelIds.add(channel.id);
+    console.log(`AI channel registered: #${channel.name} (${channel.id})`);
+  }
+});
+
+// ai-* チャンネルが削除されたら登録解除
+client.on(Events.ChannelDelete, (channel) => {
+  if (aiChannelIds.has(channel.id)) {
+    aiChannelIds.delete(channel.id);
+    console.log(`AI channel unregistered: #${channel.name} (${channel.id})`);
   }
 });
 
@@ -32,10 +60,8 @@ client.on(Events.Error, (err) => {
   console.error('Discord client error:', err.message);
 });
 
-// Gateway 接続が切れたら Cloud Run に再起動させる
 client.on(Events.ShardDisconnect, (event, id) => {
   console.error(`Shard ${id} disconnected (code: ${event.code}).`);
-  // 再接続不可能なコードのみ終了（discord.js が自動再接続しないケース）
   const noReconnectCodes = [4004, 4010, 4011, 4012, 4013, 4014];
   if (noReconnectCodes.includes(event.code)) {
     console.error('Non-resumable disconnect. Exiting for restart.');
@@ -43,7 +69,6 @@ client.on(Events.ShardDisconnect, (event, id) => {
   }
 });
 
-// 定期的に接続状態を確認（切れていたら再起動）
 setInterval(() => {
   if (!client.isReady()) {
     console.error('Client is not ready. Exiting for restart.');
@@ -52,23 +77,20 @@ setInterval(() => {
   console.log(`[heartbeat] ok — ping: ${client.ws.ping}ms`);
 }, 5 * 60 * 1000);
 
-async function ensureAiChannel(guild) {
+async function ensureDefaultChannel(guild) {
+  const defaultName = process.env.AI_CHANNEL_NAME || 'ai-chat';
   const existing = guild.channels.cache.find(
-    (ch) => ch.name === AI_CHANNEL_NAME && ch.type === ChannelType.GuildText
+    (ch) => ch.name === defaultName && ch.type === ChannelType.GuildText
   );
-  if (existing) {
-    aiChannelId = existing.id;
-    console.log(`AI channel found: #${AI_CHANNEL_NAME} (${aiChannelId})`);
-    return;
-  }
+  if (existing) return;
   try {
     const created = await guild.channels.create({
-      name: AI_CHANNEL_NAME,
+      name: defaultName,
       type: ChannelType.GuildText,
-      topic: 'サーバー内の会話を読んでAIが答えるチャンネル',
+      topic: 'AIチャットチャンネル',
     });
-    aiChannelId = created.id;
-    console.log(`AI channel created: #${AI_CHANNEL_NAME} (${aiChannelId})`);
+    aiChannelIds.add(created.id);
+    console.log(`AI channel created: #${defaultName} (${created.id})`);
     await created.send('準備できました。ここにメッセージを送ると、AIが答えます。');
   } catch (e) {
     console.error('Failed to create AI channel:', e.message);
@@ -81,7 +103,7 @@ function formatStatus(lines) {
 
 function buildServerInfo(guild) {
   const channels = guild.channels.cache
-    .filter((c) => c.type === ChannelType.GuildText)
+    .filter((c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id))
     .map((c) => `#${c.name}`)
     .join(', ');
   return `サーバー名: ${guild.name}\nチャンネル一覧: ${channels}`;
@@ -89,7 +111,7 @@ function buildServerInfo(guild) {
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
-  if (message.channelId !== aiChannelId) return;
+  if (!aiChannelIds.has(message.channelId)) return;
 
   const statusMsg = await message.reply('> ⏳ **[Router]** 判定中...');
   const statusLines = [];
@@ -101,7 +123,7 @@ client.on(Events.MessageCreate, async (message) => {
     statusLines.push(`> 🔍 **[Router]** \`${type}\` — ${reason}`);
     await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[History]** 会話履歴を取得中...']));
 
-    // ── Step 2: 会話履歴取得（Discord チャンネルから）──────
+    // ── Step 2: 会話履歴取得（チャンネルごとに独立）──────
     const history = await buildConversationHistory(
       message.channel,
       message.id,
@@ -114,8 +136,9 @@ client.on(Events.MessageCreate, async (message) => {
     let response;
 
     if (type === 'complex') {
+      // AIチャットチャンネル以外を操作対象として渡す
       const textChannels = message.guild.channels.cache.filter(
-        (c) => c.type === ChannelType.GuildText && c.id !== aiChannelId
+        (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );
       const channelList = textChannels
         .map((c) => `#${c.name}${c.topic ? ` (${c.topic})` : ''}`)
@@ -155,7 +178,7 @@ client.on(Events.MessageCreate, async (message) => {
 
       let { answer, msgs: contextMsgs } = await chatWithTools(msgs, {
         guild: message.guild,
-        aiChannelId,
+        aiChannelIds,
         onToolCall,
       });
 
@@ -187,7 +210,7 @@ client.on(Events.MessageCreate, async (message) => {
         contextMsgs.push({ role: 'system', content: `[内部指示] ${feedback}` });
         const { answer: retryAnswer } = await chatWithTools(contextMsgs, {
           guild: message.guild,
-          aiChannelId,
+          aiChannelIds,
           onToolCall: async (label) => {
             statusLines.push(`> 🔧 **[Tool]** ${label}`);
             await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[AI]** 処理中...']));

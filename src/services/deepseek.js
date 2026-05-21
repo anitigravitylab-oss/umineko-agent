@@ -13,6 +13,9 @@ messages配列には過去の会話履歴が含まれています。
 ツールを使ってチャンネルの読み書きや管理を行ってから回答してください。
 ユーザーと同じ言語で回答してください。
 
+【重要】新しいAIチャットスペース（会話用チャンネル）を作成する場合は、チャンネル名を必ず "ai-" で始めること（例: ai-general, ai-work）。
+"ai-" で始まるチャンネルは自動的にAIチャットチャンネルとして認識され、そこでもAIと会話できるようになる。
+
 利用可能なチャンネル:
 ${channelList}`;
 
@@ -177,11 +180,11 @@ async function callAPI(messages, { model, tools } = {}) {
   }
 }
 
-async function executeTool(name, args, guild, aiChannelId) {
+async function executeTool(name, args, guild, aiChannelIds) {
   console.log(`[tool] ${name} ${JSON.stringify(args)}`);
   let result;
   try {
-    result = await executeToolInner(name, args, guild, aiChannelId);
+    result = await executeToolInner(name, args, guild, aiChannelIds);
   } catch (e) {
     result = `エラー: ${e.message}`;
   }
@@ -189,11 +192,11 @@ async function executeTool(name, args, guild, aiChannelId) {
   return result;
 }
 
-async function executeToolInner(name, args, guild, aiChannelId) {
+async function executeToolInner(name, args, guild, aiChannelIds) {
   switch (name) {
     case 'read_channel': {
       const channel = guild.channels.cache.find(
-        (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && c.id !== aiChannelId
+        (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );
       if (!channel) return `チャンネル #${args.channel_name} が見つかりませんでした。`;
       const fetched = await channel.messages.fetch({ limit: 50 });
@@ -207,7 +210,7 @@ async function executeToolInner(name, args, guild, aiChannelId) {
 
     case 'send_message': {
       const channel = guild.channels.cache.find(
-        (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && c.id !== aiChannelId
+        (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );
       if (!channel) return `チャンネル #${args.channel_name} が見つかりませんでした。`;
       try {
@@ -235,7 +238,7 @@ async function executeToolInner(name, args, guild, aiChannelId) {
 
     case 'edit_channel': {
       const channel = guild.channels.cache.find(
-        (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && c.id !== aiChannelId
+        (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );
       if (!channel) return `チャンネル #${args.channel_name} が見つかりませんでした。`;
       try {
@@ -265,7 +268,7 @@ async function executeToolInner(name, args, guild, aiChannelId) {
 
     case 'delete_channel': {
       const channel = guild.channels.cache.find(
-        (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && c.id !== aiChannelId
+        (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );
       if (!channel) return `チャンネル #${args.channel_name} が見つかりませんでした。`;
       try {
@@ -346,7 +349,7 @@ export async function chatSimple(messages) {
 }
 
 // complex 用（ツール呼び出しループ）- { answer, msgs } を返す
-export async function chatWithTools(messages, { guild, aiChannelId, onToolCall }) {
+export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall }) {
   const msgs = [...messages];
   let iterations = 0;
 
@@ -360,7 +363,7 @@ export async function chatWithTools(messages, { guild, aiChannelId, onToolCall }
       const toolResults = await Promise.all(
         choice.message.tool_calls.map(async (tc) => {
           const args = JSON.parse(tc.function.arguments);
-          const result = await executeTool(tc.function.name, args, guild, aiChannelId);
+          const result = await executeTool(tc.function.name, args, guild, aiChannelIds);
           await onToolCall(toolLabel(tc.function.name, args, result));
           return { tc, result };
         })
