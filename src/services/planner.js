@@ -1,4 +1,4 @@
-const API_URL = 'https://api.deepseek.com/chat/completions';
+import { callText } from './provider.js';
 
 const SYSTEM = `あなたはDiscordサーバーのAIアシスタントのプランナーです。
 ユーザーの指示を実行するための計画を立ててください。
@@ -20,25 +20,10 @@ export async function planSearch(userMessage, channelList, history = []) {
     : '';
 
   try {
-    const res = await fetch(API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'deepseek-v4-flash',
-        messages: [
-          { role: 'system', content: SYSTEM },
-          { role: 'user', content: `${historyText}## 利用可能なチャンネル\n${channelList}\n\n## 今回の指示\n${userMessage}` },
-        ],
-        max_tokens: 300,
-      }),
-    });
-
-    if (!res.ok) throw new Error(`API error ${res.status}`);
-    const data = await res.json();
-    const raw = data.choices[0].message.content ?? '';
+    const raw = await callText([
+      { role: 'system', content: SYSTEM },
+      { role: 'user', content: `${historyText}## 利用可能なチャンネル\n${channelList}\n\n## 今回の指示\n${userMessage}` },
+    ], { maxTokens: 300 });
 
     const channelsMatch = raw.match(/"channels"\s*:\s*\[([^\]]*)\]/);
     const channels = channelsMatch

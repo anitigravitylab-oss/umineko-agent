@@ -2,7 +2,8 @@ import 'dotenv/config';
 import http from 'http';
 import { Client, GatewayIntentBits, Events, ChannelType } from 'discord.js';
 import { classify } from './services/router.js';
-import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from './services/deepseek.js';
+import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from './services/llm.js';
+import { PROVIDER, MODEL } from './services/provider.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { planSearch } from './services/planner.js';
 import { finalizeResponse } from './services/finalizer.js';
@@ -140,7 +141,7 @@ client.on(Events.MessageCreate, async (message) => {
     statusLines.push(`> 💬 **[History]** 直近 ${history.length} 件の会話を参照`);
     await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[Pipeline]** 次のステップへ...']));
 
-    const model = 'deepseek-v4-flash';
+    const model = `${PROVIDER}/${MODEL}`;
     let response;
 
     if (type === 'complex') {

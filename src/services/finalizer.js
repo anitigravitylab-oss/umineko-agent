@@ -1,4 +1,4 @@
-const API_URL = 'https://api.deepseek.com/chat/completions';
+import { callText } from './provider.js';
 
 const SYSTEM = `あなたはDiscordチャットボットの回答整形・品質チェック担当です。
 以下の作業を行ってください:
@@ -28,35 +28,20 @@ export async function finalizeResponse(userMessage, rawAnswer, history = []) {
   }
 
   try {
-    const res = await fetch(API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+    const raw = await callText([
+      { role: 'system', content: SYSTEM },
+      {
+        role: 'user',
+        content: [
+          history.length > 0
+            ? '## 直近の会話履歴\n' +
+              history.slice(-10).map((m) => `${m.role === 'user' ? 'ユーザー' : 'AI'}: ${m.content}`).join('\n')
+            : null,
+          `## 今回のユーザーの指示\n${userMessage}`,
+          `## 回答\n${cleaned}`,
+        ].filter(Boolean).join('\n\n'),
       },
-      body: JSON.stringify({
-        model: 'deepseek-v4-flash',
-        messages: [
-          { role: 'system', content: SYSTEM },
-          {
-            role: 'user',
-            content: [
-              history.length > 0
-                ? '## 直近の会話履歴\n' +
-                  history.slice(-10).map((m) => `${m.role === 'user' ? 'ユーザー' : 'AI'}: ${m.content}`).join('\n')
-                : null,
-              `## 今回のユーザーの指示\n${userMessage}`,
-              `## 回答\n${cleaned}`,
-            ].filter(Boolean).join('\n\n'),
-          },
-        ],
-        max_tokens: 2000,
-      }),
-    });
-
-    if (!res.ok) throw new Error(`API error ${res.status}`);
-    const data = await res.json();
-    const raw = data.choices[0].message.content ?? '';
+    ], { maxTokens: 2000 });
 
     const okMatch = raw.match(/"ok"\s*:\s*(true|false)/);
     const ok = okMatch?.[1] !== 'false';
