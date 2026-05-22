@@ -1,3 +1,4 @@
+import './env.js';
 import OpenAI from 'openai';
 import { GoogleGenAI } from '@google/genai';
 import { MODEL_DEFAULTS } from './constants.js';
@@ -25,6 +26,12 @@ function resolveProviderModel(provider, model) {
   const p = provider || (process.env.AI_PROVIDER || 'deepseek').toLowerCase();
   const m = model || process.env.AI_MODEL || MODEL_DEFAULTS[p] || 'deepseek-chat';
   return { p, m };
+}
+
+function tokenLimitParam(provider, maxTokens) {
+  return provider === 'openai'
+    ? { max_completion_tokens: maxTokens }
+    : { max_tokens: maxTokens };
 }
 
 // ── Gemini format converters ───────────────────────────────────────────
@@ -88,7 +95,11 @@ export async function callText(messages, { maxTokens = 4096, provider, model } =
     const response = await getGemini().models.generateContent({
       model: m,
       contents: toGeminiContents(messages),
-      config: { systemInstruction: systemMsg?.content, maxOutputTokens: maxTokens },
+      config: {
+        systemInstruction: systemMsg?.content,
+        maxOutputTokens: maxTokens,
+        thinkingConfig: { thinkingBudget: 0 },
+      },
     });
     return response.text ?? '';
   }
@@ -96,7 +107,7 @@ export async function callText(messages, { maxTokens = 4096, provider, model } =
   const completion = await getOpenAIClient(p).chat.completions.create({
     model: m,
     messages,
-    max_tokens: maxTokens,
+    ...tokenLimitParam(p, maxTokens),
   });
   return completion.choices[0].message.content ?? '';
 }
@@ -117,10 +128,13 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
         systemInstruction: systemMsg?.content,
         tools: toGeminiTools(tools),
         maxOutputTokens: 4096,
+        thinkingConfig: { thinkingBudget: 0 },
       },
     });
 
-    const fnCalls = response.functionCalls?.() ?? [];
+    const fnCalls = Array.isArray(response.functionCalls)
+      ? response.functionCalls
+      : response.functionCalls?.() ?? [];
     if (fnCalls.length > 0) {
       const toolCalls = fnCalls.map((fc) => ({
         id: makeCallId(),
@@ -152,7 +166,7 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
         model: m,
         messages,
         tools,
-        max_tokens: 4096,
+        ...tokenLimitParam(p, 4096),
       });
     } catch (e) {
       if (e.status === 503 && attempt < MAX_RETRIES) {

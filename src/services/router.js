@@ -1,3 +1,4 @@
+import './env.js';
 import { GoogleGenAI } from '@google/genai';
 import { callText } from './provider.js';
 
@@ -31,6 +32,7 @@ async function classifyOnce(userMessage, serverInfo, routerProvider, routerModel
         systemInstruction: systemWithContext,
         responseMimeType: 'application/json',
         maxOutputTokens: 150,
+        thinkingConfig: { thinkingBudget: 0 },
       },
     });
     raw = response.text ?? '';

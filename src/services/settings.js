@@ -1,3 +1,4 @@
+import './env.js';
 import { readFileSync, writeFileSync } from 'fs';
 import { MODEL_DEFAULTS, ROUTER_MODEL_DEFAULTS } from './constants.js';
 
