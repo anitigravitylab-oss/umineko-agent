@@ -117,6 +117,27 @@ npm start
 
 `/ai model` はモデル名からプロバイダーを自動判定します。例えば `gpt-*` は OpenAI、`gemini-*` は Gemini、`deepseek*` は DeepSeek に切り替わります。設定は `settings.json` に保存されるローカル実行時状態なので、Git管理には含めません。
 
+### OpenAI APIを使う
+
+OpenAIを使う場合は、[OpenAI Platform](https://platform.openai.com/api-keys) でAPIキーを作成し、`.env` に設定してください。OpenAI APIはChatGPT Plus/Proとは別のAPI課金・利用枠なので、Platform側で有効な支払い設定と利用可能なモデル権限が必要です。
+
+```bash
+OPENAI_API_KEY=sk-...
+AI_PROVIDER=openai
+# 省略時は gpt-4o-mini
+AI_MODEL=gpt-4o-mini
+```
+
+起動後にDiscordから切り替える場合:
+
+```text
+/ai provider openai
+/ai model gpt-4o-mini
+/ai model gpt-5.5
+```
+
+`gpt-*` / `o*` 系のモデル名を `/ai model` に指定すると、プロバイダーは自動で `openai` に切り替わります。OpenAIの新しい推論系モデルでは `max_tokens` ではなく `max_completion_tokens` が必要ですが、このボット側で自動的に送信パラメータを切り替えます。
+
 ### 複数サーバーでの応答制限
 
 同じDiscordアプリを複数サーバーに入れている場合は、`.env` で応答対象を制限できます。
@@ -274,6 +295,27 @@ By default, the main AI is controlled by `AI_PROVIDER` / `AI_MODEL`, and the rou
 ```
 
 `/ai model` automatically infers the provider from the model name: `gpt-*` uses OpenAI, `gemini-*` uses Gemini, and `deepseek*` uses DeepSeek. Per-guild settings are stored in local runtime state (`settings.json`) and should not be committed.
+
+### Using the OpenAI API
+
+To use OpenAI, create an API key in the [OpenAI Platform](https://platform.openai.com/api-keys) and set it in `.env`. OpenAI API usage is separate from ChatGPT Plus/Pro, so the Platform account needs valid billing and access to the model you choose.
+
+```bash
+OPENAI_API_KEY=sk-...
+AI_PROVIDER=openai
+# Defaults to gpt-4o-mini when omitted
+AI_MODEL=gpt-4o-mini
+```
+
+To switch from Discord after startup:
+
+```text
+/ai provider openai
+/ai model gpt-4o-mini
+/ai model gpt-5.5
+```
+
+When `/ai model` receives a `gpt-*` or `o*` model name, the provider is automatically switched to `openai`. Newer OpenAI reasoning models require `max_completion_tokens` instead of `max_tokens`; the bot handles that parameter switch automatically.
 
 ### Guild Filtering
 
