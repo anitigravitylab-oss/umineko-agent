@@ -1,25 +1,17 @@
 import OpenAI from 'openai';
 import { GoogleGenAI } from '@google/genai';
+import { MODEL_DEFAULTS } from './constants.js';
 
-export const PROVIDER = (process.env.AI_PROVIDER || 'deepseek').toLowerCase();
+// ── OpenAI-compatible clients (keyed by provider name) ────────────────
+const openaiClients = {};
 
-const MODEL_DEFAULTS = {
-  deepseek: 'deepseek-chat',
-  openai: 'gpt-4o-mini',
-  gemini: 'gemini-2.5-flash',
-};
-export const MODEL = process.env.AI_MODEL || MODEL_DEFAULTS[PROVIDER] || 'deepseek-chat';
-
-// ── OpenAI-compatible client (DeepSeek or OpenAI) ─────────────────────
-let _openai = null;
-function getOpenAI() {
-  if (_openai) return _openai;
-  if (PROVIDER === 'deepseek') {
-    _openai = new OpenAI({ apiKey: process.env.DEEPSEEK_API_KEY, baseURL: 'https://api.deepseek.com' });
-  } else {
-    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+function getOpenAIClient(provider) {
+  if (!openaiClients[provider]) {
+    openaiClients[provider] = provider === 'deepseek'
+      ? new OpenAI({ apiKey: process.env.DEEPSEEK_API_KEY, baseURL: 'https://api.deepseek.com' })
+      : new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   }
-  return _openai;
+  return openaiClients[provider];
 }
 
 // ── Gemini client ──────────────────────────────────────────────────────
@@ -27,6 +19,12 @@ let _gemini = null;
 function getGemini() {
   if (!_gemini) _gemini = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
   return _gemini;
+}
+
+function resolveProviderModel(provider, model) {
+  const p = provider || (process.env.AI_PROVIDER || 'deepseek').toLowerCase();
+  const m = model || process.env.AI_MODEL || MODEL_DEFAULTS[p] || 'deepseek-chat';
+  return { p, m };
 }
 
 // ── Gemini format converters ───────────────────────────────────────────
@@ -52,7 +50,6 @@ function toGeminiContents(messages) {
   const contents = [];
   for (const msg of messages) {
     if (msg.role === 'system') continue;
-
     if (msg.role === 'user') {
       contents.push({ role: 'user', parts: [{ text: msg.content ?? '' }] });
     } else if (msg.role === 'assistant') {
@@ -82,20 +79,22 @@ function makeCallId() {
 }
 
 // ── callText: simple text completion, returns string ───────────────────
-export async function callText(messages, { maxTokens = 4096 } = {}) {
-  const systemMsg = messages.find((m) => m.role === 'system');
+// provider/model are optional — fall back to env vars if omitted
+export async function callText(messages, { maxTokens = 4096, provider, model } = {}) {
+  const { p, m } = resolveProviderModel(provider, model);
+  const systemMsg = messages.find((ms) => ms.role === 'system');
 
-  if (PROVIDER === 'gemini') {
+  if (p === 'gemini') {
     const response = await getGemini().models.generateContent({
-      model: MODEL,
+      model: m,
       contents: toGeminiContents(messages),
       config: { systemInstruction: systemMsg?.content, maxOutputTokens: maxTokens },
     });
     return response.text ?? '';
   }
 
-  const completion = await getOpenAI().chat.completions.create({
-    model: MODEL,
+  const completion = await getOpenAIClient(p).chat.completions.create({
+    model: m,
     messages,
     max_tokens: maxTokens,
   });
@@ -106,11 +105,13 @@ export async function callText(messages, { maxTokens = 4096 } = {}) {
 // Returns { content, toolCalls, rawMessage }
 // toolCalls: [{id, name, arguments: object}] | null
 // rawMessage: OpenAI-format assistant message to push into msgs
-export async function callWithTools(messages, tools) {
-  if (PROVIDER === 'gemini') {
-    const systemMsg = messages.find((m) => m.role === 'system');
+export async function callWithTools(messages, tools, { provider, model } = {}) {
+  const { p, m } = resolveProviderModel(provider, model);
+
+  if (p === 'gemini') {
+    const systemMsg = messages.find((ms) => ms.role === 'system');
     const response = await getGemini().models.generateContent({
-      model: MODEL,
+      model: m,
       contents: toGeminiContents(messages),
       config: {
         systemInstruction: systemMsg?.content,
@@ -147,8 +148,8 @@ export async function callWithTools(messages, tools) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let completion;
     try {
-      completion = await getOpenAI().chat.completions.create({
-        model: MODEL,
+      completion = await getOpenAIClient(p).chat.completions.create({
+        model: m,
         messages,
         tools,
         max_tokens: 4096,

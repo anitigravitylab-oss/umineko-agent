@@ -20,7 +20,7 @@ const SYSTEM = `あなたはDiscordチャットボットの回答整形・品質
 または
 {"ok":false,"feedback":"問題点と改善指示"}`;
 
-export async function finalizeResponse(userMessage, rawAnswer, history = []) {
+export async function finalizeResponse(userMessage, rawAnswer, history = [], settings = {}) {
   const cleaned = rawAnswer?.trim() ?? '';
 
   if (!cleaned) {
@@ -41,7 +41,7 @@ export async function finalizeResponse(userMessage, rawAnswer, history = []) {
           `## 回答\n${cleaned}`,
         ].filter(Boolean).join('\n\n'),
       },
-    ], { maxTokens: 2000 });
+    ], { maxTokens: 2000, provider: settings.provider, model: settings.model });
 
     const okMatch = raw.match(/"ok"\s*:\s*(true|false)/);
     const ok = okMatch?.[1] !== 'false';

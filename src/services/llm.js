@@ -488,16 +488,20 @@ function toolLabel(name, args, result) {
   }
 }
 
-export async function chatSimple(messages) {
-  return callText(messages);
+// settings: { provider, model } — optional, falls back to env vars
+export async function chatSimple(messages, settings = {}) {
+  return callText(messages, { provider: settings.provider, model: settings.model });
 }
 
-export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall }) {
+export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall, settings = {} }) {
   const msgs = [...messages];
   let iterations = 0;
 
   while (iterations < MAX_TOOL_CALLS) {
-    const { content, toolCalls, rawMessage } = await providerCallWithTools(msgs, TOOLS);
+    const { content, toolCalls, rawMessage } = await providerCallWithTools(msgs, TOOLS, {
+      provider: settings.provider,
+      model: settings.model,
+    });
 
     if (toolCalls) {
       msgs.push(rawMessage);
@@ -517,7 +521,7 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall 
     } else {
       if (!content || !content.trim()) {
         msgs.push({ role: 'user', content: 'ツールの実行結果を踏まえて、ユーザーへの回答を生成してください。' });
-        const followUp = await callText(msgs);
+        const followUp = await callText(msgs, { provider: settings.provider, model: settings.model });
         return { answer: followUp, msgs };
       }
       return { answer: content, msgs };
@@ -525,10 +529,10 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall 
   }
 
   msgs.push({ role: 'user', content: '収集した情報をもとに、最初の質問に答えてください。' });
-  const answer = await callText(msgs);
+  const answer = await callText(msgs, { provider: settings.provider, model: settings.model });
   return { answer, msgs };
 }
 
-export async function generateFinal(messages) {
-  return callText(messages);
+export async function generateFinal(messages, settings = {}) {
+  return callText(messages, { provider: settings.provider, model: settings.model });
 }

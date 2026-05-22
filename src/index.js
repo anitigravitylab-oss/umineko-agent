@@ -1,12 +1,20 @@
 import 'dotenv/config';
 import http from 'http';
-import { Client, GatewayIntentBits, Events, ChannelType } from 'discord.js';
+import { Client, GatewayIntentBits, Events, ChannelType, REST, Routes } from 'discord.js';
 import { classify } from './services/router.js';
 import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from './services/llm.js';
-import { PROVIDER, MODEL } from './services/provider.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { planSearch } from './services/planner.js';
 import { finalizeResponse } from './services/finalizer.js';
+import {
+  getGuildSettings,
+  updateGuildSettings,
+  resetGuildSettings,
+  resolveModel,
+  resolveRouterModel,
+  MODEL_DEFAULTS,
+  ROUTER_MODEL_DEFAULTS,
+} from './services/settings.js';
 
 const PORT = process.env.PORT || 8080;
 http.createServer((req, res) => res.end('ok')).listen(PORT);
@@ -20,7 +28,90 @@ const client = new Client({
   ],
 });
 
-// ai- で始まるチャンネルをすべてAIチャットチャンネルとして扱う
+// ── スラッシュコマンド定義 ─────────────────────────────────────────────
+const AI_COMMAND = {
+  name: 'ai',
+  description: 'AIプロバイダー・モデルの設定（管理者のみ）',
+  default_member_permissions: '8', // Administrator
+  options: [
+    {
+      type: 1, // SUB_COMMAND
+      name: 'status',
+      description: '現在のAI設定を表示',
+    },
+    {
+      type: 1,
+      name: 'provider',
+      description: 'メインAI（チャット・プランナー・整形）のプロバイダーを変更',
+      options: [{
+        type: 3, // STRING
+        name: 'value',
+        description: 'プロバイダー名',
+        required: true,
+        choices: [
+          { name: 'DeepSeek', value: 'deepseek' },
+          { name: 'OpenAI', value: 'openai' },
+          { name: 'Gemini', value: 'gemini' },
+        ],
+      }],
+    },
+    {
+      type: 1,
+      name: 'model',
+      description: 'メインAIのモデル名を変更（"default" でリセット）',
+      options: [{
+        type: 3,
+        name: 'value',
+        description: 'モデル名（例: gpt-4o, gemini-2.5-pro, deepseek-chat）',
+        required: true,
+      }],
+    },
+    {
+      type: 1,
+      name: 'router',
+      description: 'simple/complex 判定に使うプロバイダーを変更',
+      options: [{
+        type: 3,
+        name: 'value',
+        description: 'プロバイダー名',
+        required: true,
+        choices: [
+          { name: 'Gemini（デフォルト・高速）', value: 'gemini' },
+          { name: 'DeepSeek', value: 'deepseek' },
+          { name: 'OpenAI', value: 'openai' },
+        ],
+      }],
+    },
+    {
+      type: 1,
+      name: 'router-model',
+      description: 'ルーターのモデル名を変更（"default" でリセット）',
+      options: [{
+        type: 3,
+        name: 'value',
+        description: 'モデル名（例: gemini-2.5-flash-lite, gpt-4o-mini）',
+        required: true,
+      }],
+    },
+    {
+      type: 1,
+      name: 'reset',
+      description: 'すべての設定を環境変数のデフォルトに戻す',
+    },
+  ],
+};
+
+async function registerCommands(clientId, guildId) {
+  const rest = new REST().setToken(process.env.DISCORD_TOKEN);
+  try {
+    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: [AI_COMMAND] });
+    console.log(`[commands] Registered /ai for guild ${guildId}`);
+  } catch (e) {
+    console.error(`[commands] Failed to register for guild ${guildId}:`, e.message);
+  }
+}
+
+// ── AI_CHANNEL_PREFIX ────────────────────────────────────────────────
 const AI_CHANNEL_PREFIX = process.env.AI_CHANNEL_PREFIX || 'ai-';
 const aiChannelIds = new Set();
 
@@ -31,7 +122,6 @@ function isAiChatChannel(channel) {
 client.once(Events.ClientReady, async (c) => {
   console.log(`Ready! Logged in as ${c.user.tag}`);
   for (const [, guild] of c.guilds.cache) {
-    // 既存の ai-* チャンネルをすべて登録
     for (const [, channel] of guild.channels.cache) {
       if (isAiChatChannel(channel)) {
         aiChannelIds.add(channel.id);
@@ -39,10 +129,14 @@ client.once(Events.ClientReady, async (c) => {
       }
     }
     await ensureDefaultChannel(guild);
+    await registerCommands(c.user.id, guild.id);
   }
 });
 
-// ai-* チャンネルが新規作成されたら自動登録
+client.on(Events.GuildCreate, async (guild) => {
+  await registerCommands(client.user.id, guild.id);
+});
+
 client.on(Events.ChannelCreate, (channel) => {
   if (isAiChatChannel(channel)) {
     aiChannelIds.add(channel.id);
@@ -50,7 +144,6 @@ client.on(Events.ChannelCreate, (channel) => {
   }
 });
 
-// ai-* チャンネルが削除されたら登録解除
 client.on(Events.ChannelDelete, (channel) => {
   if (aiChannelIds.has(channel.id)) {
     aiChannelIds.delete(channel.id);
@@ -111,9 +204,111 @@ function buildServerInfo(guild) {
   return `サーバー名: ${guild.name}\nチャンネル一覧: ${channels}`;
 }
 
+// ── スラッシュコマンドハンドラー ──────────────────────────────────────
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'ai') return;
+
+  const guildId = interaction.guild.id;
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === 'status') {
+    const s = getGuildSettings(guildId);
+    const mainModel = resolveModel(s.provider, s.model);
+    const routerModel = resolveRouterModel(s.routerProvider, s.routerModel);
+    const modelLabel = s.model ? `\`${s.model}\`` : `\`${mainModel}\` (デフォルト)`;
+    const routerModelLabel = s.routerModel ? `\`${s.routerModel}\`` : `\`${routerModel}\` (デフォルト)`;
+    await interaction.reply({
+      content: [
+        '**現在のAI設定**',
+        `メインAI : \`${s.provider}\` / モデル: ${modelLabel}`,
+        `ルーター  : \`${s.routerProvider}\` / モデル: ${routerModelLabel}`,
+      ].join('\n'),
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (sub === 'provider') {
+    const value = interaction.options.getString('value');
+    // プロバイダー変更時はモデルをリセット
+    updateGuildSettings(guildId, { provider: value, model: null });
+    const defaultModel = MODEL_DEFAULTS[value] ?? '?';
+    await interaction.reply({
+      content: `✅ メインAIを \`${value}\` に変更しました。\nデフォルトモデル: \`${defaultModel}\``,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (sub === 'model') {
+    const value = interaction.options.getString('value');
+    if (value === 'default') {
+      updateGuildSettings(guildId, { model: null });
+      const s = getGuildSettings(guildId);
+      await interaction.reply({
+        content: `✅ モデルをデフォルト (\`${MODEL_DEFAULTS[s.provider] ?? '?'}\`) にリセットしました。`,
+        ephemeral: true,
+      });
+    } else {
+      updateGuildSettings(guildId, { model: value });
+      await interaction.reply({
+        content: `✅ メインAIのモデルを \`${value}\` に変更しました。`,
+        ephemeral: true,
+      });
+    }
+    return;
+  }
+
+  if (sub === 'router') {
+    const value = interaction.options.getString('value');
+    updateGuildSettings(guildId, { routerProvider: value, routerModel: null });
+    const defaultModel = ROUTER_MODEL_DEFAULTS[value] ?? '?';
+    await interaction.reply({
+      content: `✅ ルーターを \`${value}\` に変更しました。\nデフォルトモデル: \`${defaultModel}\``,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  if (sub === 'router-model') {
+    const value = interaction.options.getString('value');
+    if (value === 'default') {
+      updateGuildSettings(guildId, { routerModel: null });
+      const s = getGuildSettings(guildId);
+      await interaction.reply({
+        content: `✅ ルーターモデルをデフォルト (\`${ROUTER_MODEL_DEFAULTS[s.routerProvider] ?? '?'}\`) にリセットしました。`,
+        ephemeral: true,
+      });
+    } else {
+      updateGuildSettings(guildId, { routerModel: value });
+      await interaction.reply({
+        content: `✅ ルーターのモデルを \`${value}\` に変更しました。`,
+        ephemeral: true,
+      });
+    }
+    return;
+  }
+
+  if (sub === 'reset') {
+    const s = resetGuildSettings(guildId);
+    await interaction.reply({
+      content: [
+        '✅ 設定を環境変数のデフォルトに戻しました。',
+        `メインAI : \`${s.provider}\` / モデル: \`${resolveModel(s.provider, s.model)}\``,
+        `ルーター  : \`${s.routerProvider}\` / モデル: \`${resolveRouterModel(s.routerProvider, s.routerModel)}\``,
+      ].join('\n'),
+      ephemeral: true,
+    });
+  }
+});
+
+// ── メッセージハンドラー ───────────────────────────────────────────────
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (!aiChannelIds.has(message.channelId)) return;
+
+  const settings = getGuildSettings(message.guild.id);
+  const modelDisplay = `${settings.provider}/${resolveModel(settings.provider, settings.model)}`;
 
   const statusMsg = await message.reply('> ⏳ **[Router]** 判定中...');
   const statusLines = [];
@@ -128,11 +323,14 @@ client.on(Events.MessageCreate, async (message) => {
   try {
     // ── Step 1: ルーティング判定 ──────────────────────────
     const serverInfo = buildServerInfo(message.guild);
-    const { type, reason } = await classify(message.content, serverInfo);
+    const { type, reason } = await classify(message.content, serverInfo, {
+      routerProvider: settings.routerProvider,
+      routerModel: settings.routerModel,
+    });
     statusLines.push(`> 🔍 **[Router]** \`${type}\` — ${reason}`);
     await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[History]** 会話履歴を取得中...']));
 
-    // ── Step 2: 会話履歴取得（チャンネルごとに独立）──────
+    // ── Step 2: 会話履歴取得 ──────────────────────────────
     const history = await buildConversationHistory(
       message.channel,
       message.id,
@@ -141,11 +339,9 @@ client.on(Events.MessageCreate, async (message) => {
     statusLines.push(`> 💬 **[History]** 直近 ${history.length} 件の会話を参照`);
     await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[Pipeline]** 次のステップへ...']));
 
-    const model = `${PROVIDER}/${MODEL}`;
     let response;
 
     if (type === 'complex') {
-      // AIチャットチャンネル以外を操作対象として渡す
       const textChannels = message.guild.channels.cache.filter(
         (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );
@@ -157,7 +353,7 @@ client.on(Events.MessageCreate, async (message) => {
       statusLines.push('> 🗺️ **[Plan]** 調査計画を立案中...');
       await statusMsg.edit(formatStatus(statusLines));
 
-      const plan = await planSearch(message.content, channelList, history);
+      const plan = await planSearch(message.content, channelList, history, settings);
       const planLabel = [
         plan.channels.length > 0 ? plan.channels.map((c) => `#${c}`).join(', ') : null,
         plan.approach || null,
@@ -170,8 +366,8 @@ client.on(Events.MessageCreate, async (message) => {
           (plan.approach ? `\n方針: ${plan.approach}` : '')
         : buildSystemWithTools(channelList);
 
-      // ── Step 4: Tool calls（並列実行）────────────────────
-      statusLines.push(`> ✍️ **[AI]** 調査中... \`${model}\``);
+      // ── Step 4: Tool calls ────────────────────────────────
+      statusLines.push(`> ✍️ **[AI]** 調査中... \`${modelDisplay}\``);
       await statusMsg.edit(formatStatus(statusLines));
 
       const msgs = [
@@ -189,20 +385,23 @@ client.on(Events.MessageCreate, async (message) => {
         guild: message.guild,
         aiChannelIds,
         onToolCall,
+        settings,
       });
 
-      // ── Step 5: Finalize（整形 + 品質チェック + Retry）──────
+      // ── Step 5: Finalize ──────────────────────────────────
       response = answer;
       const MAX_RETRIES = 2;
       for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        statusLines.push(`> ✨ **[Finalize]** 整形中...`);
+        statusLines.push('> ✨ **[Finalize]** 整形中...');
         await statusMsg.edit(formatStatus(statusLines));
 
-        const { ok, answer: finalAnswer, feedback } = await finalizeResponse(message.content, response, history);
+        const { ok, answer: finalAnswer, feedback } = await finalizeResponse(
+          message.content, response, history, settings
+        );
 
         if (ok) {
           response = finalAnswer;
-          statusLines[statusLines.length - 1] = `> ✨ **[Finalize]** 完了`;
+          statusLines[statusLines.length - 1] = '> ✨ **[Finalize]** 完了';
           break;
         }
 
@@ -211,7 +410,7 @@ client.on(Events.MessageCreate, async (message) => {
         await statusMsg.edit(formatStatus(statusLines));
 
         if (attempt === MAX_RETRIES) {
-          statusLines.push(`> ⚠️ **[Finalize]** リトライ上限到達`);
+          statusLines.push('> ⚠️ **[Finalize]** リトライ上限到達');
           break;
         }
 
@@ -224,12 +423,13 @@ client.on(Events.MessageCreate, async (message) => {
             statusLines.push(`> 🔧 **[Tool]** ${label}`);
             await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[AI]** 処理中...']));
           },
+          settings,
         });
         response = retryAnswer;
       }
     } else {
       // ── Simple path ───────────────────────────────────────
-      statusLines.push(`> ✍️ **[AI]** 生成中... \`${model}\``);
+      statusLines.push(`> ✍️ **[AI]** 生成中... \`${modelDisplay}\``);
       await statusMsg.edit(formatStatus(statusLines));
 
       const msgs = [
@@ -237,7 +437,7 @@ client.on(Events.MessageCreate, async (message) => {
         ...history,
         { role: 'user', content: message.content },
       ];
-      response = await chatSimple(msgs);
+      response = await chatSimple(msgs, settings);
     }
 
     // ── 送信 ─────────────────────────────────────────────
@@ -247,7 +447,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (type !== 'complex') {
-      statusLines[statusLines.length - 1] = `> ✅ **[AI]** 生成完了 \`${model}\``;
+      statusLines[statusLines.length - 1] = `> ✅ **[AI]** 生成完了 \`${modelDisplay}\``;
     }
     await statusMsg.edit(formatStatus(statusLines));
 
