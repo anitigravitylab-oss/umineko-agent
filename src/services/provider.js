@@ -120,7 +120,8 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
       },
     });
 
-    const fnCalls = response.functionCalls?.() ?? [];
+    const rawFc = response.functionCalls;
+    const fnCalls = Array.isArray(rawFc) ? rawFc : (typeof rawFc === 'function' ? rawFc() : []);
     if (fnCalls.length > 0) {
       const toolCalls = fnCalls.map((fc) => ({
         id: makeCallId(),

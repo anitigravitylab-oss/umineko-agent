@@ -111,6 +111,22 @@ async function registerCommands(clientId, guildId) {
   }
 }
 
+// ── ギルドフィルター ──────────────────────────────────────────────────
+// ALLOWED_GUILDS=id1,id2  → 指定ギルドのみ応答
+// IGNORED_GUILDS=id1,id2  → 指定ギルドを無視
+const ALLOWED_GUILDS = process.env.ALLOWED_GUILDS
+  ? new Set(process.env.ALLOWED_GUILDS.split(',').map((s) => s.trim()))
+  : null;
+const IGNORED_GUILDS = process.env.IGNORED_GUILDS
+  ? new Set(process.env.IGNORED_GUILDS.split(',').map((s) => s.trim()))
+  : null;
+
+function isGuildAllowed(guildId) {
+  if (ALLOWED_GUILDS && !ALLOWED_GUILDS.has(guildId)) return false;
+  if (IGNORED_GUILDS && IGNORED_GUILDS.has(guildId)) return false;
+  return true;
+}
+
 // ── AI_CHANNEL_PREFIX ────────────────────────────────────────────────
 const AI_CHANNEL_PREFIX = process.env.AI_CHANNEL_PREFIX || 'ai-';
 const aiChannelIds = new Set();
@@ -121,7 +137,13 @@ function isAiChatChannel(channel) {
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`Ready! Logged in as ${c.user.tag}`);
+  if (ALLOWED_GUILDS) console.log(`[filter] ALLOWED_GUILDS: ${[...ALLOWED_GUILDS].join(', ')}`);
+  if (IGNORED_GUILDS) console.log(`[filter] IGNORED_GUILDS: ${[...IGNORED_GUILDS].join(', ')}`);
   for (const [, guild] of c.guilds.cache) {
+    if (!isGuildAllowed(guild.id)) {
+      console.log(`[filter] Skipping guild ${guild.name} (${guild.id})`);
+      continue;
+    }
     for (const [, channel] of guild.channels.cache) {
       if (isAiChatChannel(channel)) {
         aiChannelIds.add(channel.id);
@@ -207,6 +229,7 @@ function buildServerInfo(guild) {
 // ── スラッシュコマンドハンドラー ──────────────────────────────────────
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'ai') return;
+  if (!interaction.guild || !isGuildAllowed(interaction.guild.id)) return;
 
   const guildId = interaction.guild.id;
   const sub = interaction.options.getSubcommand();
@@ -250,9 +273,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         ephemeral: true,
       });
     } else {
-      updateGuildSettings(guildId, { model: value });
+      // モデル名からプロバイダーを自動推定
+      let autoProvider = null;
+      if (/^gpt-|^o1|^o3|^o4/.test(value)) autoProvider = 'openai';
+      else if (/^gemini-/.test(value)) autoProvider = 'gemini';
+      else if (/^deepseek/.test(value)) autoProvider = 'deepseek';
+
+      const prevSettings = getGuildSettings(guildId);
+      const patch = { model: value };
+      if (autoProvider && autoProvider !== prevSettings.provider) patch.provider = autoProvider;
+      updateGuildSettings(guildId, patch);
+
+      const s = getGuildSettings(guildId);
+      const providerNote = patch.provider
+        ? `\nプロバイダーも \`${patch.provider}\` に自動変更しました。`
+        : `\n現在のプロバイダー: \`${s.provider}\`（変更は \`/ai provider\` で）`;
       await interaction.reply({
-        content: `✅ メインAIのモデルを \`${value}\` に変更しました。`,
+        content: `✅ モデルを \`${value}\` に変更しました。${providerNote}`,
         ephemeral: true,
       });
     }
@@ -305,6 +342,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // ── メッセージハンドラー ───────────────────────────────────────────────
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+  if (!message.guild || !isGuildAllowed(message.guild.id)) return;
   if (!aiChannelIds.has(message.channelId)) return;
 
   const settings = getGuildSettings(message.guild.id);
