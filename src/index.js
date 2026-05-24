@@ -377,11 +377,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const hitChannels = [];
     for (const channel of allTextChannels.values()) {
       try {
-        // First batch: last 100 messages
         let fetched = await channel.messages.fetch({ limit: 100 });
         let channelCount = 0;
         let batch = 1;
-        const MAX_BATCHES = 5; // up to 500 messages per channel
+        const MAX_BATCHES = 30; // 最大3000件/チャンネル
         while (batch <= MAX_BATCHES && fetched.size > 0) {
           const userMsgs = [...fetched.values()]
             .filter((m) => m.author.id === interaction.user.id && m.content.trim());
@@ -389,11 +388,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
             userMessages.push({ channel: channel.name, content: m.content });
           }
           channelCount += userMsgs.length;
-          // If batch had user messages, keep paginating until zero.
-          // If batch found none but channel has no hits yet, try one more batch
-          // (messages may be buried beyond the 100 most recent in active channels).
           if (userMsgs.length === 0) {
-            if (channelCount > 0 || batch >= 2) break;
+            // すでに発言が見つかっている → これより古い発言はない。打ち切り
+            if (channelCount > 0) break;
+            // 発言なしチャンネルは2回だけ試して諦める（API節約）
+            if (batch >= 2) break;
           }
           const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
           const before = sorted[0]?.id;
