@@ -41,22 +41,6 @@ const AI_COMMAND = {
     },
     {
       type: 1,
-      name: 'provider',
-      description: 'メインAI（チャット・プランナー・整形）のプロバイダーを変更',
-      options: [{
-        type: 3, // STRING
-        name: 'value',
-        description: 'プロバイダー名',
-        required: true,
-        choices: [
-          { name: 'DeepSeek', value: 'deepseek' },
-          { name: 'OpenAI', value: 'openai' },
-          { name: 'Gemini', value: 'gemini' },
-        ],
-      }],
-    },
-    {
-      type: 1,
       name: 'model',
       description: 'メインAIのモデルを変更（プロバイダーも自動切替）',
       options: [{
@@ -263,18 +247,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `メインAI : \`${s.provider}\` / モデル: ${modelLabel}`,
         `ルーター  : \`${s.routerProvider}\` / モデル: ${routerModelLabel}`,
       ].join('\n'),
-      ephemeral: true,
-    });
-    return;
-  }
-
-  if (sub === 'provider') {
-    const value = interaction.options.getString('value');
-    // プロバイダー変更時はモデルをリセット
-    updateGuildSettings(guildId, { provider: value, model: null });
-    const defaultModel = MODEL_DEFAULTS[value] ?? '?';
-    await interaction.reply({
-      content: `✅ メインAIを \`${value}\` に変更しました。\nデフォルトモデル: \`${defaultModel}\``,
       ephemeral: true,
     });
     return;
