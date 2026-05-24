@@ -117,6 +117,7 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
         systemInstruction: systemMsg?.content,
         tools: toGeminiTools(tools),
         maxOutputTokens: 4096,
+        thinkingConfig: { thinkingBudget: 0 },
       },
     });
 
