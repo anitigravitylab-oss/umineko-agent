@@ -123,7 +123,11 @@ export async function callText(messages, { maxTokens = 4096, provider, model } =
     messages,
     ...tokenParam,
   });
-  return completion.choices[0].message.content ?? '';
+  const content = completion.choices?.[0]?.message?.content ?? '';
+  if (!content || !content.trim()) {
+    console.warn(`[provider] callText returned empty/null content (model=${m}, finish=${completion.choices?.[0]?.finish_reason})`);
+  }
+  return content;
 }
 
 // ── callWithTools: tool-use completion ────────────────────────────────

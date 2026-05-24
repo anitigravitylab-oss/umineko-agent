@@ -131,22 +131,28 @@ export async function extractUserContext(userMessages, settings = {}) {
     .map((m) => `[#${m.channel}] ${m.content}`)
     .join('\n');
 
-  try {
-    const summary = await callText([
-      { role: 'system', content: PROMPT_EXTRACT_USER },
-      { role: 'user', content: `## ユーザーの全発言履歴\n${text}` },
-    ], { maxTokens: 2500, provider: settings.provider, model: settings.model });
+  const msgs = [
+    { role: 'system', content: PROMPT_EXTRACT_USER },
+    { role: 'user', content: `## ユーザーの全発言履歴\n${text}` },
+  ];
 
-    if (!summary || !summary.trim()) {
-      console.warn(`[research:user] callText returned empty (${userMessages.length} messages, ${text.length} chars)`);
-      return '';
+  // DeepSeek sometimes returns empty on first attempt; retry once
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const summary = await callText(msgs, {
+        maxTokens: 2500, provider: settings.provider, model: settings.model,
+      });
+      if (summary && summary.trim()) {
+        console.log(`[research:user] extracted profile (${summary.length} chars, attempt ${attempt}): ${summary.slice(0, 120)}...`);
+        return summary;
+      }
+      console.warn(`[research:user] callText returned empty on attempt ${attempt} (${userMessages.length} msgs, ${text.length} chars input)`);
+    } catch (e) {
+      console.warn(`[research:user] attempt ${attempt} failed: ${e.message}`);
+      if (attempt >= 2) return '';
     }
-    console.log(`[research:user] extracted profile: ${summary.slice(0, 150)}...`);
-    return summary;
-  } catch (e) {
-    console.warn(`[research:user] failed: ${e.message}`);
-    return '';
   }
+  return '';
 }
 
 // settings: { provider, model }
@@ -157,26 +163,36 @@ export async function planResearch(query, channelContext, settings = {}) {
     '上記をもとに、ウェブ検索の調査計画を立ててください。',
   ].filter(Boolean).join('\n\n');
 
-  try {
-    const raw = await callText([
-      { role: 'system', content: PROMPT_PLAN },
-      { role: 'user', content: prompt },
-    ], { maxTokens: 1500, provider: settings.provider, model: settings.model });
+  const msgs = [
+    { role: 'system', content: PROMPT_PLAN },
+    { role: 'user', content: prompt },
+  ];
 
-    // JSONを抽出
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const plan = JSON.parse(jsonMatch[0]);
-      console.log(`[research:plan] subQuestions=${plan.subQuestions?.length ?? 0} searchQueries=${plan.searchQueries?.length ?? 0} angles=${plan.angles?.length ?? 0}`);
-      return plan;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const raw = await callText(msgs, {
+        maxTokens: 1500, provider: settings.provider, model: settings.model,
+      });
+
+      if (!raw || !raw.trim()) {
+        console.warn(`[research:plan] callText returned empty on attempt ${attempt}`);
+        continue;
+      }
+
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const plan = JSON.parse(jsonMatch[0]);
+        console.log(`[research:plan] subQuestions=${plan.subQuestions?.length ?? 0} searchQueries=${plan.searchQueries?.length ?? 0} angles=${plan.angles?.length ?? 0}`);
+        return plan;
+      }
+      console.warn(`[research:plan] JSON parse failed, returning rawPlan (${raw.length} chars)`);
+      return { rawPlan: raw };
+    } catch (e) {
+      console.warn(`[research:plan] attempt ${attempt} failed: ${e.message}`);
+      if (attempt >= 2) return {};
     }
-    // JSONパース失敗時は生テキストを返す
-    console.warn(`[research:plan] JSON parse failed, returning rawPlan (${raw.length} chars)`);
-    return { rawPlan: raw };
-  } catch (e) {
-    console.warn(`[research:plan] failed: ${e.message}`, e.stack);
-    return {};
   }
+  return {};
 }
 
 // settings: { provider, model }
