@@ -390,7 +390,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.editReply(formatStatus([...statusLines, '> ⏳ 処理中...']));
     };
 
-    const report = await runResearch(query, contextText, settings, onStatus);
+    const report = await runResearch(query, contextText, {
+      guild: interaction.guild,
+      aiChannelIds,
+      onToolCall: onStatus,
+      settings,
+    });
 
     statusLines.push('> ✅ **[Research]** 完了');
     await interaction.editReply(formatStatus(statusLines));
