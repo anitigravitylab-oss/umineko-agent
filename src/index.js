@@ -389,8 +389,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
             userMessages.push({ channel: channel.name, content: m.content });
           }
           channelCount += userMsgs.length;
-          // Only paginate further if this batch found user messages
-          if (userMsgs.length === 0) break;
+          // If batch had user messages, keep paginating until zero.
+          // If batch found none but channel has no hits yet, try one more batch
+          // (messages may be buried beyond the 100 most recent in active channels).
+          if (userMsgs.length === 0) {
+            if (channelCount > 0 || batch >= 2) break;
+          }
           const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
           const before = sorted[0]?.id;
           if (!before) break;
