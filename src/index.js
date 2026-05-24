@@ -377,14 +377,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const hitChannels = [];
     for (const channel of allTextChannels.values()) {
       try {
-        const fetched = await channel.messages.fetch({ limit: 100 });
-        const userMsgs = [...fetched.values()]
-          .filter((m) => m.author.id === interaction.user.id && m.content.trim());
-        if (userMsgs.length > 0) {
-          hitChannels.push(`#${channel.name}(${userMsgs.length})`);
+        // First batch: last 100 messages
+        let fetched = await channel.messages.fetch({ limit: 100 });
+        let channelCount = 0;
+        let batch = 1;
+        const MAX_BATCHES = 5; // up to 500 messages per channel
+        while (batch <= MAX_BATCHES && fetched.size > 0) {
+          const userMsgs = [...fetched.values()]
+            .filter((m) => m.author.id === interaction.user.id && m.content.trim());
           for (const m of userMsgs) {
             userMessages.push({ channel: channel.name, content: m.content });
           }
+          channelCount += userMsgs.length;
+          // Only paginate further if this batch found user messages
+          if (userMsgs.length === 0) break;
+          const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+          const before = sorted[0]?.id;
+          if (!before) break;
+          fetched = await channel.messages.fetch({ limit: 100, before });
+          batch++;
+        }
+        if (channelCount > 0) {
+          hitChannels.push(`#${channel.name}(${channelCount})`);
         }
       } catch { /* skip channels we can't read */ }
     }
