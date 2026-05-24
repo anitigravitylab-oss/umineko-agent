@@ -140,7 +140,7 @@ export async function extractUserContext(userMessages, settings = {}) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const summary = await callText(msgs, {
-        maxTokens: 2500, provider: settings.provider, model: settings.model,
+        maxTokens: 5000, provider: settings.provider, model: settings.model,
       });
       if (summary && summary.trim()) {
         console.log(`[research:user] extracted profile (${summary.length} chars, attempt ${attempt}): ${summary.slice(0, 120)}...`);
@@ -171,7 +171,7 @@ export async function planResearch(query, channelContext, settings = {}) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const raw = await callText(msgs, {
-        maxTokens: 1500, provider: settings.provider, model: settings.model,
+        maxTokens: 3000, provider: settings.provider, model: settings.model,
       });
 
       if (!raw || !raw.trim()) {
