@@ -391,8 +391,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (userMsgs.length === 0) {
             // すでに発言が見つかっている → これより古い発言はない。打ち切り
             if (channelCount > 0) break;
-            // 発言なしチャンネルは2回だけ試して諦める（API節約）
-            if (batch >= 2) break;
+            // 発言なしチャンネルも5回（500件）までは遡る
+            if (batch >= 5) break;
           }
           const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
           const before = sorted[0]?.id;
