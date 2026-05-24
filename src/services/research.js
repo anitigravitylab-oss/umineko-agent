@@ -247,7 +247,7 @@ export async function runResearch(query, contextText, settings = {}, onStatus = 
     content: 'ここまで集めた情報をもとに、包括的な最終レポートを作成してください。引用元URLを必ず記載すること。',
   });
   const finalReport = await callText(msgs, {
-    maxTokens: 8192,
+    maxTokens: 16384,
     provider: settings.provider,
     model: settings.model,
   });
