@@ -3,9 +3,11 @@ import http from 'http';
 import { Client, GatewayIntentBits, Events, ChannelType, REST, Routes } from 'discord.js';
 import { classify } from './services/router.js';
 import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from './services/llm.js';
+import { callText } from './services/provider.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { planSearch } from './services/planner.js';
 import { finalizeResponse } from './services/finalizer.js';
+import { runResearch } from './services/research.js';
 import {
   getGuildSettings,
   updateGuildSettings,
@@ -102,10 +104,21 @@ const AI_COMMAND = {
   ],
 };
 
+const RESEARCH_COMMAND = {
+  name: 'research',
+  description: 'ウェブ検索を使った深掘りリサーチを実行',
+  options: [{
+    type: 3,
+    name: 'query',
+    description: '調べたいこと',
+    required: true,
+  }],
+};
+
 async function registerCommands(clientId, guildId) {
   const rest = new REST().setToken(process.env.DISCORD_TOKEN);
   try {
-    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: [AI_COMMAND] });
+    await rest.put(Routes.applicationGuildCommands(clientId, guildId), { body: [AI_COMMAND, RESEARCH_COMMAND] });
     console.log(`[commands] Registered /ai for guild ${guildId}`);
   } catch (e) {
     console.error(`[commands] Failed to register for guild ${guildId}:`, e.message);
@@ -325,6 +338,77 @@ client.on(Events.InteractionCreate, async (interaction) => {
       ].join('\n'),
       ephemeral: true,
     });
+  }
+});
+
+// ── /research ハンドラー ───────────────────────────────────────────────
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'research') return;
+  if (!interaction.guild || !isGuildAllowed(interaction.guild.id)) return;
+
+  const query = interaction.options.getString('query');
+  const settings = getGuildSettings(interaction.guild.id);
+  const modelDisplay = `${settings.provider}/${resolveModel(settings.provider, settings.model)}`;
+
+  // 即応答（Deferred — リサーチに時間がかかるため）
+  await interaction.deferReply();
+
+  try {
+    const statusLines = [`> 🔬 **[Research]** \`${query}\` — ${modelDisplay}`];
+
+    // Step 1: 会話履歴からリサーチ関連文脈を抽出
+    statusLines.push('> 📖 **[Context]** 会話履歴から関連情報を抽出中...');
+    await interaction.editReply(formatStatus(statusLines));
+
+    const recentMessages = await interaction.channel.messages.fetch({ limit: 20 });
+    const historyLines = [...recentMessages.values()]
+      .reverse()
+      .filter((m) => !m.author.bot || m.author.id === client.user.id)
+      .map((m) => `${m.author.bot ? 'AI' : m.author.username}: ${m.content}`)
+      .join('\n');
+
+    let contextText = '';
+    if (historyLines.length > 0) {
+      const PROMPT_EXTRACT = `以下の会話履歴から、リサーチクエリ「${query}」に関連する情報だけを抜き出してください。無関係な雑談は省いてください。関連情報がない場合は「なし」とだけ返してください。\n\n${historyLines}`;
+      contextText = await callText(
+        [{ role: 'user', content: PROMPT_EXTRACT }],
+        { maxTokens: 1000, provider: settings.provider, model: settings.model }
+      );
+    }
+
+    if (contextText && !contextText.includes('なし')) {
+      const preview = contextText.length > 150 ? contextText.slice(0, 150) + '...' : contextText;
+      statusLines[statusLines.length - 1] = `> 📖 **[Context]** 抽出完了: ${preview}`;
+    } else {
+      statusLines[statusLines.length - 1] = '> 📖 **[Context]** 関連情報なし（クエリのみで実行）';
+    }
+    await interaction.editReply(formatStatus(statusLines));
+
+    // Step 2-4: リサーチループ → レポート生成
+    const onStatus = async (label) => {
+      statusLines.push(`> ${label}`);
+      await interaction.editReply(formatStatus([...statusLines, '> ⏳ 処理中...']));
+    };
+
+    const report = await runResearch(query, contextText, settings, onStatus);
+
+    statusLines.push('> ✅ **[Research]** 完了');
+    await interaction.editReply(formatStatus(statusLines));
+
+    // レポートを分割送信
+    const chunks = (report ?? 'レポート生成に失敗しました。').match(/.{1,2000}/gs) ?? [];
+    await interaction.followUp({ content: chunks[0] });
+    for (let i = 1; i < chunks.length; i++) {
+      await interaction.channel.send(chunks[i]);
+    }
+
+  } catch (e) {
+    console.error('Research error:', e.message);
+    const errorLines = [
+      `> 🔬 **[Research]** \`${query}\``,
+      `> ❌ **[Error]** ${e.message}`,
+    ];
+    await interaction.editReply(formatStatus(errorLines)).catch(() => {});
   }
 });
 
