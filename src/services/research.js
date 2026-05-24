@@ -165,14 +165,19 @@ export async function extractUserContext(userMessages, settings = {}) {
 
 // settings: { provider, model }
 export async function planResearch(query, channelContext, settings = {}) {
-  const prompt = [
-    `## リサーチクエリ\n${query}`,
-    channelContext ? `## Discordチャンネルから収集した情報\n${channelContext}` : '',
-    '上記をもとに、ウェブ検索の調査計画を立ててください。',
-  ].filter(Boolean).join('\n\n');
+  // Build a single unified prompt — no system message, everything in user content.
+  // Gemini Flash ignores context passed as secondary info; inlining forces it.
+  const parts = [
+    '## ユーザーのスキル・状況（最重要）',
+    channelContext || '(ユーザー情報なし)',
+    '## リサーチクエリ',
+    query,
+    '## 指示',
+    PROMPT_PLAN,
+  ];
+  const prompt = parts.join('\n\n');
 
   const msgs = [
-    { role: 'system', content: PROMPT_PLAN },
     { role: 'user', content: prompt },
   ];
 
