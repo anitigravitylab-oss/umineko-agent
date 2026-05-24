@@ -371,7 +371,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.editReply(formatStatus(statusLines));
 
     const allTextChannels = interaction.guild.channels.cache.filter(
-      (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
+      (c) => c.type === ChannelType.GuildText
     );
     const userMessages = [];
     const hitChannels = [];
