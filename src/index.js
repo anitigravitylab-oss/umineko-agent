@@ -374,17 +374,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
     );
     const userMessages = [];
+    const hitChannels = [];
     for (const channel of allTextChannels.values()) {
       try {
         const fetched = await channel.messages.fetch({ limit: 100 });
         const userMsgs = [...fetched.values()]
           .filter((m) => m.author.id === interaction.user.id && m.content.trim());
-        for (const m of userMsgs) {
-          userMessages.push({ channel: channel.name, content: m.content });
+        if (userMsgs.length > 0) {
+          hitChannels.push(`#${channel.name}(${userMsgs.length})`);
+          for (const m of userMsgs) {
+            userMessages.push({ channel: channel.name, content: m.content });
+          }
         }
       } catch { /* skip channels we can't read */ }
     }
-    statusLines[statusLines.length - 1] = `> 🔍 **[Scan]** ${userMessages.length}件のユーザー発言を収集（${allTextChannels.size}チャンネル横断）`;
+    console.log(`[research:scan] user=${interaction.user.username}(${interaction.user.id}) channels=${allTextChannels.size} hit=${hitChannels.join(', ')} total=${userMessages.length}`);
+    statusLines[statusLines.length - 1] = `> 🔍 **[Scan]** ${userMessages.length}件のユーザー発言を収集（${allTextChannels.size}チャンネル中 ${hitChannels.length}chに発言あり）`;
 
     // Step 3: ユーザー背景を抽出
     statusLines.push('> 👤 **[Profile]** ユーザー背景を分析中...');
@@ -400,7 +405,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.editReply(formatStatus(statusLines));
 
     // Step 4: 調査計画を立案（ユーザー背景を踏まえて）
-    const contextText = userProfile || '';
+    let contextText = userProfile || '';
     statusLines.push('> 📋 **[Plan]** Web検索の調査計画を立案中...');
     await interaction.editReply(formatStatus(statusLines));
 
