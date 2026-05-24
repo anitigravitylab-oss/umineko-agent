@@ -1,7 +1,7 @@
 import { ChannelType } from 'discord.js';
 import { callText, callWithTools as providerCallWithTools } from './provider.js';
 
-const MAX_TOOL_CALLS = 15;
+const MAX_ITERATIONS = 10;
 
 export const SYSTEM_SIMPLE = `あなたはDiscordサーバーのAIアシスタントです。
 messages配列には過去の会話履歴が含まれています。それを参照しながら最後のuserメッセージに答えてください。
@@ -497,7 +497,7 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall,
   const msgs = [...messages];
   let iterations = 0;
 
-  while (iterations < MAX_TOOL_CALLS) {
+  while (iterations < MAX_ITERATIONS) {
     const { content, toolCalls, rawMessage } = await providerCallWithTools(msgs, TOOLS, {
       provider: settings.provider,
       model: settings.model,
@@ -509,7 +509,7 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall,
       const toolResults = await Promise.all(
         toolCalls.map(async (tc) => {
           const result = await executeTool(tc.name, tc.arguments, guild, aiChannelIds);
-          await onToolCall(toolLabel(tc.name, tc.arguments, result));
+          await onToolCall(toolLabel(tc.name, tc.arguments, result)).catch(() => {});
           return { tc, result };
         })
       );
@@ -517,7 +517,7 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall,
       for (const { tc, result } of toolResults) {
         msgs.push({ role: 'tool', tool_call_id: tc.id, content: result });
       }
-      iterations += toolCalls.length;
+      iterations += 1;
     } else {
       if (!content || !content.trim()) {
         msgs.push({ role: 'user', content: 'ツールの実行結果を踏まえて、ユーザーへの回答を生成してください。' });

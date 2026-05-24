@@ -54,16 +54,16 @@ function toGeminiContents(messages) {
       contents.push({ role: 'user', parts: [{ text: msg.content ?? '' }] });
     } else if (msg.role === 'assistant') {
       if (msg.tool_calls?.length) {
-        contents.push({
-          role: 'model',
-          parts: msg.tool_calls.map((tc) => {
-            const part = {
-              functionCall: { name: tc.function.name, args: JSON.parse(tc.function.arguments) },
-            };
-            if (tc._thoughtSignature) part.thoughtSignature = tc._thoughtSignature;
-            return part;
-          }),
-        });
+        const parts = [];
+        if (msg.content) parts.push({ text: msg.content });
+        for (const tc of msg.tool_calls) {
+          const part = {
+            functionCall: { name: tc.function.name, args: JSON.parse(tc.function.arguments) },
+          };
+          if (tc._thoughtSignature) part.thoughtSignature = tc._thoughtSignature;
+          parts.push(part);
+        }
+        contents.push({ role: 'model', parts });
       } else {
         contents.push({ role: 'model', parts: [{ text: msg.content ?? '' }] });
       }
@@ -71,11 +71,16 @@ function toGeminiContents(messages) {
       const name = findToolName(messages, msg.tool_call_id);
       contents.push({
         role: 'user',
-        parts: [{ functionResponse: { name, response: { output: msg.content } } }],
+        parts: [{ functionResponse: { name, response: { output: String(msg.content ?? '') } } }],
       });
     }
   }
   return contents;
+}
+
+function isGeminiRetryable(e) {
+  return e.status === 503 || e.status === 429 ||
+    (typeof e.message === 'string' && (e.message.includes('UNAVAILABLE') || e.message.includes('overloaded')));
 }
 
 function makeCallId() {
@@ -89,12 +94,27 @@ export async function callText(messages, { maxTokens = 4096, provider, model } =
   const systemMsg = messages.find((ms) => ms.role === 'system');
 
   if (p === 'gemini') {
-    const response = await getGemini().models.generateContent({
-      model: m,
-      contents: toGeminiContents(messages),
-      config: { systemInstruction: systemMsg?.content, maxOutputTokens: maxTokens },
-    });
-    return response.text ?? '';
+    const MAX_GEMINI_RETRIES = 3;
+    let lastErr;
+    for (let attempt = 1; attempt <= MAX_GEMINI_RETRIES; attempt++) {
+      try {
+        const response = await getGemini().models.generateContent({
+          model: m,
+          contents: toGeminiContents(messages),
+          config: { systemInstruction: systemMsg?.content, maxOutputTokens: maxTokens },
+        });
+        return response.text ?? '';
+      } catch (e) {
+        if (isGeminiRetryable(e) && attempt < MAX_GEMINI_RETRIES) {
+          console.warn(`[provider] Gemini callText 503/429 attempt ${attempt}, retrying in ${attempt * 5}s...`);
+          await new Promise((r) => setTimeout(r, attempt * 5000));
+          lastErr = e;
+          continue;
+        }
+        throw e;
+      }
+    }
+    throw lastErr;
   }
 
   const tokenParam = p === 'openai' ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens };
@@ -115,16 +135,33 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
 
   if (p === 'gemini') {
     const systemMsg = messages.find((ms) => ms.role === 'system');
-    const response = await getGemini().models.generateContent({
-      model: m,
-      contents: toGeminiContents(messages),
-      config: {
-        systemInstruction: systemMsg?.content,
-        tools: toGeminiTools(tools),
-        maxOutputTokens: 4096,
-        thinkingConfig: { thinkingBudget: 0 },
-      },
-    });
+    const MAX_GEMINI_RETRIES = 3;
+    let lastErr;
+    let response;
+    for (let attempt = 1; attempt <= MAX_GEMINI_RETRIES; attempt++) {
+      try {
+        response = await getGemini().models.generateContent({
+          model: m,
+          contents: toGeminiContents(messages),
+          config: {
+            systemInstruction: systemMsg?.content,
+            tools: toGeminiTools(tools),
+            maxOutputTokens: 4096,
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        });
+        break;
+      } catch (e) {
+        if (isGeminiRetryable(e) && attempt < MAX_GEMINI_RETRIES) {
+          console.warn(`[provider] Gemini callWithTools 503/429 attempt ${attempt}, retrying in ${attempt * 5}s...`);
+          await new Promise((r) => setTimeout(r, attempt * 5000));
+          lastErr = e;
+          continue;
+        }
+        throw e;
+      }
+    }
+    if (!response) throw lastErr;
 
     const respParts = response.candidates?.[0]?.content?.parts ?? [];
     const fnParts = respParts.filter((p) => p.functionCall);

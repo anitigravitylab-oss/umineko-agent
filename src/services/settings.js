@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync } from 'fs';
 import { MODEL_DEFAULTS, ROUTER_MODEL_DEFAULTS } from './constants.js';
 
 const SETTINGS_FILE = 'settings.json';
@@ -16,8 +16,13 @@ const store = (() => {
 })();
 
 function save() {
-  try { writeFileSync(SETTINGS_FILE, JSON.stringify(store, null, 2)); }
-  catch (e) { console.warn('[settings] save failed:', e.message); }
+  const tmp = SETTINGS_FILE + '.tmp';
+  try {
+    writeFileSync(tmp, JSON.stringify(store, null, 2));
+    renameSync(tmp, SETTINGS_FILE);
+  } catch (e) {
+    console.warn('[settings] save failed:', e.message);
+  }
 }
 
 export function getGuildSettings(guildId) {
