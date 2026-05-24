@@ -422,7 +422,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.editReply(formatStatus(statusLines));
 
     // Step 4: 調査計画を立案（ユーザー背景を踏まえて）
-    let contextText = userProfile || '';
+    const nowJST = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    let contextText = `【現在日時（日本時間）: ${nowJST}】\n\n${userProfile || ''}`;
     statusLines.push('> 📋 **[Plan]** Web検索の調査計画を立案中...');
     await interaction.editReply(formatStatus(statusLines));
 
