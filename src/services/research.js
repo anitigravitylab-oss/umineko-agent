@@ -33,18 +33,34 @@ const WEB_ONLY_TOOLS = [
   },
 ];
 
-const SYSTEM_RESEARCH = `あなたはDiscordサーバーのリサーチアシスタントです。
-与えられたクエリについて、ウェブ検索を使って深掘りリサーチを行い、包括的なレポートを作成してください。
+const PROMPT_PLAN = `あなたはリサーチ計画の立案者です。
+与えられたクエリと、事前に収集したDiscordチャンネルの情報をもとに、ウェブ検索の調査計画を立ててください。
+
+以下のJSON形式で返してください:
+{
+  "subQuestions": ["サブ質問1", "サブ質問2", ...],
+  "searchQueries": ["検索キーワード1", "検索キーワード2", ...],
+  "angles": ["調査の観点1", "調査の観点2", ...]
+}
+
+- subQuestions: リサーチクエリを分解した具体的なサブ質問（3〜7個）
+- searchQueries: 実際に検索に使うキーワード（5〜10個、多角的に）
+- angles: 調査すべき観点や切り口（例: 歴史的背景、技術仕様、賛否両論など）
+- Discord情報が得られている場合は、それを補完するような検索キーワードを含めること`;
+
+const SYSTEM_RESEARCH = `あなたはリサーチアシスタントです。
+与えられた調査計画に沿って、ウェブ検索を使って深掘りリサーチを行い、包括的なレポートを作成してください。
 
 【手順】
-1. クエリを複数のサブ質問に分解し、それぞれについて検索する
+1. 調査計画の各サブ質問について、対応する検索キーワードで検索する
 2. 検索結果の上位を fetch_url で実際に読み、内容を確認する
-3. 情報が不足している場合は、異なるキーワードや角度から追加検索する
-4. 十分な情報が集まったら、最終レポートを作成する
+3. 情報が不足している場合は、計画になかった角度からも追加検索する
+4. すべての観点をカバーできたら、最終レポートを作成する
 
 【重要なルール】
-- 最低5回以上、異なる検索クエリで調べること
+- 調査計画の全サブ質問と全観点をカバーすること
 - 得られた情報には必ず引用元URLを記載すること
+- Discordから得た情報とWebの情報を統合して回答すること
 - 矛盾する情報があれば両論を併記すること
 - 日本語で回答すること`;
 
@@ -93,16 +109,48 @@ function toolLabel(name, args) {
 }
 
 // settings: { provider, model }
+export async function planResearch(query, channelContext, settings = {}) {
+  const prompt = [
+    `## リサーチクエリ\n${query}`,
+    channelContext ? `## Discordチャンネルから収集した情報\n${channelContext}` : '',
+    '上記をもとに、ウェブ検索の調査計画を立ててください。',
+  ].filter(Boolean).join('\n\n');
+
+  try {
+    const raw = await callText([
+      { role: 'system', content: PROMPT_PLAN },
+      { role: 'user', content: prompt },
+    ], { maxTokens: 1500, provider: settings.provider, model: settings.model });
+
+    // JSONを抽出
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const plan = JSON.parse(jsonMatch[0]);
+      console.log(`[research:plan] subQuestions=${plan.subQuestions?.length ?? 0} searchQueries=${plan.searchQueries?.length ?? 0} angles=${plan.angles?.length ?? 0}`);
+      return plan;
+    }
+    // JSONパース失敗時は生テキストを返す
+    return { rawPlan: raw };
+  } catch (e) {
+    console.warn(`[research:plan] failed: ${e.message}`);
+    return {};
+  }
+}
+
+// settings: { provider, model }
 export async function runResearch(query, contextText, settings = {}, onStatus = async () => {}) {
+  // 調査計画を contextText から取り出す（planResearchの結果がJSONとして渡される想定）
+  let researchPlan = '';
+  if (contextText) {
+    researchPlan = `## 事前収集情報と調査計画\n${contextText}`;
+  }
+
   const msgs = [
     { role: 'system', content: SYSTEM_RESEARCH },
   ];
 
-  if (contextText) {
-    msgs.push({
-      role: 'system',
-      content: `## 会話の背景（参考）\n以下はリサーチクエリに関連する過去の会話から抽出された情報です。\nリサーチの方向性を決める参考にしてください:\n\n${contextText}`,
-    });
+  if (researchPlan) {
+    msgs.push({ role: 'system', content: researchPlan });
   }
 
   msgs.push({ role: 'user', content: `以下のリサーチクエリについて、深掘り調査を実行し、包括的なレポートを作成してください。\n\nリサーチクエリ: ${query}` });

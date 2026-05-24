@@ -6,7 +6,7 @@ import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from '
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { planSearch } from './services/planner.js';
 import { finalizeResponse } from './services/finalizer.js';
-import { runResearch } from './services/research.js';
+import { runResearch, planResearch } from './services/research.js';
 import {
   getGuildSettings,
   updateGuildSettings,
@@ -411,11 +411,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (!plan.channels.length && !plan.approach) {
-      statusLines.push('> 📖 **[Context]** 関連情報なし（クエリのみで実行）');
+      statusLines.push('> 📖 **[Context]** チャンネル情報なし');
       await interaction.editReply(formatStatus(statusLines));
     }
 
-    // Step 4: リサーチループ → レポート生成
+    // Step 4: 調査計画を立案（チャンネル内容を踏まえて）
+    statusLines.push('> 📋 **[Plan]** Web検索の調査計画を立案中...');
+    await interaction.editReply(formatStatus(statusLines));
+
+    const researchPlan = await planResearch(query, contextText, settings);
+    let planSummary = '';
+    if (researchPlan.subQuestions) {
+      planSummary = [
+        `サブ質問${researchPlan.subQuestions.length}件`,
+        `検索ワード${researchPlan.searchQueries?.length ?? 0}件`,
+        `観点${researchPlan.angles?.length ?? 0}件`,
+      ].join(', ');
+      contextText += `\n\n## 調査計画\n### サブ質問\n${researchPlan.subQuestions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`;
+      contextText += `\n### 検索キーワード\n${researchPlan.searchQueries?.join(', ') ?? ''}`;
+      contextText += `\n### 調査の観点\n${researchPlan.angles?.map((a) => `- ${a}`).join('\n') ?? ''}`;
+    } else if (researchPlan.rawPlan) {
+      planSummary = '計画生成（非構造化）';
+      contextText += `\n\n## 調査計画\n${researchPlan.rawPlan}`;
+    }
+    statusLines[statusLines.length - 1] = `> 📋 **[Plan]** ${planSummary || '計画なし'}`;
+    await interaction.editReply(formatStatus(statusLines));
+
+    // Step 5: リサーチループ → レポート生成
     const onStatus = async (label) => {
       statusLines.push(`> ${label}`);
       await interaction.editReply(formatStatus([...statusLines, '> ⏳ 処理中...']));
