@@ -3,7 +3,6 @@ import http from 'http';
 import { Client, GatewayIntentBits, Events, ChannelType, REST, Routes } from 'discord.js';
 import { classify } from './services/router.js';
 import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from './services/llm.js';
-import { callText } from './services/provider.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { planSearch } from './services/planner.js';
 import { finalizeResponse } from './services/finalizer.js';
@@ -356,46 +355,73 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     const statusLines = [`> 🔬 **[Research]** \`${query}\` — ${modelDisplay}`];
 
-    // Step 1: 会話履歴からリサーチ関連文脈を抽出
-    statusLines.push('> 📖 **[Context]** 会話履歴から関連情報を抽出中...');
+    // Step 1: 会話履歴を取得（complexと同じ）
+    statusLines.push('> 💬 **[History]** 会話履歴を取得中...');
     await interaction.editReply(formatStatus(statusLines));
 
-    const recentMessages = await interaction.channel.messages.fetch({ limit: 20 });
-    const historyLines = [...recentMessages.values()]
-      .reverse()
-      .filter((m) => !m.author.bot || m.author.id === client.user.id)
-      .map((m) => `${m.author.bot ? 'AI' : m.author.username}: ${m.content}`)
+    const history = await buildConversationHistory(
+      interaction.channel,
+      null,
+      client.user.id
+    );
+    statusLines[statusLines.length - 1] = `> 💬 **[History]** 直近 ${history.length} 件の会話を参照`;
+
+    // Step 2: 読むべきチャンネルを planSearch で決定（complexと同じ）
+    const textChannels = interaction.guild.channels.cache.filter(
+      (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
+    );
+    const channelList = textChannels
+      .map((c) => `#${c.name} [ID:${c.id}]${c.topic ? ` (${c.topic})` : ''}`)
       .join('\n');
 
-    let contextText = '';
-    if (historyLines.length > 0) {
-      const PROMPT_EXTRACT = `以下の会話履歴から、リサーチクエリ「${query}」に関連する情報だけを抜き出してください。無関係な雑談は省いてください。関連情報がない場合は「なし」とだけ返してください。\n\n${historyLines}`;
-      contextText = await callText(
-        [{ role: 'user', content: PROMPT_EXTRACT }],
-        { maxTokens: 1000, provider: settings.provider, model: settings.model }
-      );
-    }
-
-    if (contextText && !contextText.includes('なし')) {
-      const preview = contextText.length > 150 ? contextText.slice(0, 150) + '...' : contextText;
-      statusLines[statusLines.length - 1] = `> 📖 **[Context]** 抽出完了: ${preview}`;
-    } else {
-      statusLines[statusLines.length - 1] = '> 📖 **[Context]** 関連情報なし（クエリのみで実行）';
-    }
+    statusLines.push('> 🗺️ **[Plan]** 調査計画を立案中...');
     await interaction.editReply(formatStatus(statusLines));
 
-    // Step 2-4: リサーチループ → レポート生成
+    const plan = await planSearch(query, channelList, history, settings);
+    const planLabel = [
+      plan.channels.length > 0 ? plan.channels.map((c) => `#${c}`).join(', ') : null,
+      plan.approach || null,
+    ].filter(Boolean).join(' — ') || 'Web検索のみ';
+    statusLines[statusLines.length - 1] = `> 🗺️ **[Plan]** ${planLabel}`;
+
+    // Step 3: 計画されたチャンネルを実際に読む
+    let contextText = plan.approach || '';
+    for (const chName of plan.channels) {
+      const channel = textChannels.find((c) => c.name === chName);
+      if (!channel) continue;
+      try {
+        const fetched = await channel.messages.fetch({ limit: 50 });
+        const content = [...fetched.values()]
+          .reverse()
+          .filter((m) => m.content.trim())
+          .map((m) => `[#${chName}] ${m.author.username}: ${m.content}`)
+          .join('\n');
+        const label = content
+          ? `${content.split('\n').length}件`
+          : '空';
+        statusLines.push(`> 📖 **[Read]** #${chName} → ${label}`);
+        await interaction.editReply(formatStatus(statusLines));
+        if (content) {
+          contextText += `\n\n## #${chName} の内容\n${content}`;
+        }
+      } catch (e) {
+        statusLines.push(`> ⚠️ **[Read]** #${chName} → 失敗: ${e.message}`);
+        await interaction.editReply(formatStatus(statusLines));
+      }
+    }
+
+    if (!plan.channels.length && !plan.approach) {
+      statusLines.push('> 📖 **[Context]** 関連情報なし（クエリのみで実行）');
+      await interaction.editReply(formatStatus(statusLines));
+    }
+
+    // Step 4: リサーチループ → レポート生成
     const onStatus = async (label) => {
       statusLines.push(`> ${label}`);
       await interaction.editReply(formatStatus([...statusLines, '> ⏳ 処理中...']));
     };
 
-    const report = await runResearch(query, contextText, {
-      guild: interaction.guild,
-      aiChannelIds,
-      onToolCall: onStatus,
-      settings,
-    });
+    const report = await runResearch(query, contextText, settings, onStatus);
 
     statusLines.push('> ✅ **[Research]** 完了');
     await interaction.editReply(formatStatus(statusLines));
