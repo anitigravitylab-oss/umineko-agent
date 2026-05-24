@@ -56,9 +56,13 @@ function toGeminiContents(messages) {
       if (msg.tool_calls?.length) {
         contents.push({
           role: 'model',
-          parts: msg.tool_calls.map((tc) => ({
-            functionCall: { name: tc.function.name, args: JSON.parse(tc.function.arguments) },
-          })),
+          parts: msg.tool_calls.map((tc) => {
+            const part = {
+              functionCall: { name: tc.function.name, args: JSON.parse(tc.function.arguments) },
+            };
+            if (tc._thoughtSignature) part.thoughtSignature = tc._thoughtSignature;
+            return part;
+          }),
         });
       } else {
         contents.push({ role: 'model', parts: [{ text: msg.content ?? '' }] });
@@ -93,10 +97,11 @@ export async function callText(messages, { maxTokens = 4096, provider, model } =
     return response.text ?? '';
   }
 
+  const tokenParam = p === 'openai' ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens };
   const completion = await getOpenAIClient(p).chat.completions.create({
     model: m,
     messages,
-    max_tokens: maxTokens,
+    ...tokenParam,
   });
   return completion.choices[0].message.content ?? '';
 }
@@ -121,13 +126,14 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
       },
     });
 
-    const rawFc = response.functionCalls;
-    const fnCalls = Array.isArray(rawFc) ? rawFc : (typeof rawFc === 'function' ? rawFc() : []);
-    if (fnCalls.length > 0) {
-      const toolCalls = fnCalls.map((fc) => ({
+    const respParts = response.candidates?.[0]?.content?.parts ?? [];
+    const fnParts = respParts.filter((p) => p.functionCall);
+    if (fnParts.length > 0) {
+      const toolCalls = fnParts.map((p) => ({
         id: makeCallId(),
-        name: fc.name,
-        arguments: fc.args,
+        name: p.functionCall.name,
+        arguments: p.functionCall.args,
+        _thoughtSignature: p.thoughtSignature,
       }));
       const rawMessage = {
         role: 'assistant',
@@ -136,6 +142,7 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
           id: tc.id,
           type: 'function',
           function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+          _thoughtSignature: tc._thoughtSignature,
         })),
       };
       return { content: null, toolCalls, rawMessage };
@@ -150,11 +157,12 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let completion;
     try {
+      const tokenParam = p === 'openai' ? { max_completion_tokens: 4096 } : { max_tokens: 4096 };
       completion = await getOpenAIClient(p).chat.completions.create({
         model: m,
         messages,
         tools,
-        max_tokens: 4096,
+        ...tokenParam,
       });
     } catch (e) {
       if (e.status === 503 && attempt < MAX_RETRIES) {
