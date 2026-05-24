@@ -446,7 +446,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
   } catch (e) {
-    console.error('Research error:', e.message);
+    console.error('Research error:', e.message, '\n', e.stack);
     const errorLines = [
       `> 🔬 **[Research]** \`${query}\``,
       `> ❌ **[Error]** ${e.message}`,

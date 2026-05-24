@@ -137,9 +137,12 @@ export async function extractUserContext(userMessages, settings = {}) {
       { role: 'user', content: `## ユーザーの全発言履歴\n${text}` },
     ], { maxTokens: 2500, provider: settings.provider, model: settings.model });
 
-    const preview = (summary ?? '').slice(0, 150);
-    console.log(`[research:user] extracted profile: ${preview}...`);
-    return summary ?? '';
+    if (!summary || !summary.trim()) {
+      console.warn(`[research:user] callText returned empty (${userMessages.length} messages, ${text.length} chars)`);
+      return '';
+    }
+    console.log(`[research:user] extracted profile: ${summary.slice(0, 150)}...`);
+    return summary;
   } catch (e) {
     console.warn(`[research:user] failed: ${e.message}`);
     return '';
@@ -168,9 +171,10 @@ export async function planResearch(query, channelContext, settings = {}) {
       return plan;
     }
     // JSONパース失敗時は生テキストを返す
+    console.warn(`[research:plan] JSON parse failed, returning rawPlan (${raw.length} chars)`);
     return { rawPlan: raw };
   } catch (e) {
-    console.warn(`[research:plan] failed: ${e.message}`);
+    console.warn(`[research:plan] failed: ${e.message}`, e.stack);
     return {};
   }
 }
