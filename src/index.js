@@ -6,7 +6,7 @@ import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from '
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { planSearch } from './services/planner.js';
 import { finalizeResponse } from './services/finalizer.js';
-import { runResearch, planResearch } from './services/research.js';
+import { runResearch, planResearch, extractUserContext } from './services/research.js';
 import {
   getGuildSettings,
   updateGuildSettings,
@@ -366,56 +366,41 @@ client.on(Events.InteractionCreate, async (interaction) => {
     );
     statusLines[statusLines.length - 1] = `> 💬 **[History]** 直近 ${history.length} 件の会話を参照`;
 
-    // Step 2: 読むべきチャンネルを planSearch で決定（complexと同じ）
-    const textChannels = interaction.guild.channels.cache.filter(
-      (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
-    );
-    const channelList = textChannels
-      .map((c) => `#${c.name} [ID:${c.id}]${c.topic ? ` (${c.topic})` : ''}`)
-      .join('\n');
-
-    statusLines.push('> 🗺️ **[Plan]** 調査計画を立案中...');
+    // Step 2: 全チャンネルからユーザーの発言を収集
+    statusLines.push('> 🔍 **[Scan]** 全チャンネルからユーザー発言を収集中...');
     await interaction.editReply(formatStatus(statusLines));
 
-    const plan = await planSearch(query, channelList, history, settings);
-    const planLabel = [
-      plan.channels.length > 0 ? plan.channels.map((c) => `#${c}`).join(', ') : null,
-      plan.approach || null,
-    ].filter(Boolean).join(' — ') || 'Web検索のみ';
-    statusLines[statusLines.length - 1] = `> 🗺️ **[Plan]** ${planLabel}`;
-
-    // Step 3: 計画されたチャンネルを実際に読む
-    let contextText = plan.approach || '';
-    for (const chName of plan.channels) {
-      const channel = textChannels.find((c) => c.name === chName);
-      if (!channel) continue;
+    const allTextChannels = interaction.guild.channels.cache.filter(
+      (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
+    );
+    const userMessages = [];
+    for (const channel of allTextChannels.values()) {
       try {
-        const fetched = await channel.messages.fetch({ limit: 50 });
-        const content = [...fetched.values()]
-          .reverse()
-          .filter((m) => m.content.trim())
-          .map((m) => `[#${chName}] ${m.author.username}: ${m.content}`)
-          .join('\n');
-        const label = content
-          ? `${content.split('\n').length}件`
-          : '空';
-        statusLines.push(`> 📖 **[Read]** #${chName} → ${label}`);
-        await interaction.editReply(formatStatus(statusLines));
-        if (content) {
-          contextText += `\n\n## #${chName} の内容\n${content}`;
+        const fetched = await channel.messages.fetch({ limit: 100 });
+        const userMsgs = [...fetched.values()]
+          .filter((m) => m.author.id === interaction.user.id && m.content.trim());
+        for (const m of userMsgs) {
+          userMessages.push({ channel: channel.name, content: m.content });
         }
-      } catch (e) {
-        statusLines.push(`> ⚠️ **[Read]** #${chName} → 失敗: ${e.message}`);
-        await interaction.editReply(formatStatus(statusLines));
-      }
+      } catch { /* skip channels we can't read */ }
     }
+    statusLines[statusLines.length - 1] = `> 🔍 **[Scan]** ${userMessages.length}件のユーザー発言を収集（${allTextChannels.size}チャンネル横断）`;
 
-    if (!plan.channels.length && !plan.approach) {
-      statusLines.push('> 📖 **[Context]** チャンネル情報なし');
-      await interaction.editReply(formatStatus(statusLines));
+    // Step 3: ユーザー背景を抽出
+    statusLines.push('> 👤 **[Profile]** ユーザー背景を分析中...');
+    await interaction.editReply(formatStatus(statusLines));
+
+    const userProfile = await extractUserContext(userMessages, settings);
+    if (userProfile) {
+      const preview = userProfile.length > 150 ? userProfile.slice(0, 150) + '...' : userProfile;
+      statusLines[statusLines.length - 1] = `> 👤 **[Profile]** ${preview}`;
+    } else {
+      statusLines[statusLines.length - 1] = '> 👤 **[Profile]** 情報なし';
     }
+    await interaction.editReply(formatStatus(statusLines));
 
-    // Step 4: 調査計画を立案（チャンネル内容を踏まえて）
+    // Step 4: 調査計画を立案（ユーザー背景を踏まえて）
+    const contextText = userProfile || '';
     statusLines.push('> 📋 **[Plan]** Web検索の調査計画を立案中...');
     await interaction.editReply(formatStatus(statusLines));
 

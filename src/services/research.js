@@ -33,6 +33,21 @@ const WEB_ONLY_TOOLS = [
   },
 ];
 
+const PROMPT_EXTRACT_USER = `あなたはユーザー分析の専門家です。
+以下はDiscord上での特定ユーザーの全発言履歴です。
+
+この発言履歴から、以下の項目をできるだけ詳細に抽出してください:
+
+1. **興味・関心領域**: どんな技術・分野・話題に繰り返し言及しているか
+2. **スキル・知識**: どの分野に詳しそうか、どんな技術スタックを持っているか
+3. **進行中のプロジェクト**: 何を作っているか、どんな課題に取り組んでいるか
+4. **価値観・こだわり**: 判断や選択の基準、よく使うフレーズ、思想的な傾向
+5. **経歴・文脈**: 発言から推測できる経歴、所属、やってきたこと
+6. **人間関係**: 誰とよく話しているか、メンションの傾向（IDはそのまま記載）
+
+各項目について、具体的な発言内容を引用しながら記述してください。
+最大2000文字。情報がない項目は「不明」と記載すること。`;
+
 const PROMPT_PLAN = `あなたはリサーチ計画の立案者です。
 与えられたクエリと、事前に収集したDiscordチャンネルの情報をもとに、ウェブ検索の調査計画を立ててください。
 
@@ -105,6 +120,29 @@ function toolLabel(name, args) {
     case 'search_web': return `検索: "${args.query}"`;
     case 'fetch_url': return `取得: ${args.url.slice(0, 60)}...`;
     default: return name;
+  }
+}
+
+// userMessages: [{channel, content}, ...]
+export async function extractUserContext(userMessages, settings = {}) {
+  if (!userMessages || userMessages.length === 0) return '';
+
+  const text = userMessages
+    .map((m) => `[#${m.channel}] ${m.content}`)
+    .join('\n');
+
+  try {
+    const summary = await callText([
+      { role: 'system', content: PROMPT_EXTRACT_USER },
+      { role: 'user', content: `## ユーザーの全発言履歴\n${text}` },
+    ], { maxTokens: 2500, provider: settings.provider, model: settings.model });
+
+    const preview = (summary ?? '').slice(0, 150);
+    console.log(`[research:user] extracted profile: ${preview}...`);
+    return summary ?? '';
+  } catch (e) {
+    console.warn(`[research:user] failed: ${e.message}`);
+    return '';
   }
 }
 
