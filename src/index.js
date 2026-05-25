@@ -7,7 +7,7 @@ import { buildConversationHistory } from './services/historyBuilder.js';
 import { planSearch } from './services/planner.js';
 import { finalizeResponse } from './services/finalizer.js';
 
-const PORT = process.env.PORT || 8080;
+const PORT = parseInt(process.env.PORT || '8080', 10);
 http.createServer((req, res) => res.end('ok')).listen(PORT);
 
 const client = new Client({
