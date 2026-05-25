@@ -91,7 +91,9 @@ function makeCallId() {
 // provider/model are optional — fall back to env vars if omitted
 export async function callText(messages, { maxTokens = 4096, provider, model } = {}) {
   const { p, m } = resolveProviderModel(provider, model);
-  const systemMsg = messages.find((ms) => ms.role === 'system');
+  // Collect ALL system messages (not just the first one)
+  const systemMsgs = messages.filter((ms) => ms.role === 'system');
+  const systemInstruction = systemMsgs.map((ms) => ms.content).join('\n\n') || undefined;
 
   if (p === 'gemini') {
     const MAX_GEMINI_RETRIES = 3;
@@ -101,7 +103,7 @@ export async function callText(messages, { maxTokens = 4096, provider, model } =
         const response = await getGemini().models.generateContent({
           model: m,
           contents: toGeminiContents(messages),
-          config: { systemInstruction: systemMsg?.content, maxOutputTokens: maxTokens },
+          config: { systemInstruction, maxOutputTokens: maxTokens },
         });
         return response.text ?? '';
       } catch (e) {
@@ -138,7 +140,10 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
   const { p, m } = resolveProviderModel(provider, model);
 
   if (p === 'gemini') {
-    const systemMsg = messages.find((ms) => ms.role === 'system');
+    const systemInstruction = messages
+      .filter((ms) => ms.role === 'system')
+      .map((ms) => ms.content)
+      .join('\n\n') || undefined;
     const MAX_GEMINI_RETRIES = 3;
     let lastErr;
     let response;
@@ -148,7 +153,7 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
           model: m,
           contents: toGeminiContents(messages),
           config: {
-            systemInstruction: systemMsg?.content,
+            systemInstruction,
             tools: toGeminiTools(tools),
             maxOutputTokens: 4096,
             thinkingConfig: { thinkingBudget: 0 },
