@@ -261,7 +261,7 @@ async function callAPI(messages, { model, tools } = {}) {
         signal: AbortSignal.timeout(30000),
       });
     } catch (e) {
-      const isRetryable = e.name === 'AbortError' || e.name === 'TypeError';
+      const isRetryable = e.name === 'AbortError' || e.name === 'TimeoutError' || e.name === 'TypeError';
       console.warn(`[deepseek] fetch failed on attempt ${attempt}: ${e.message}`);
       if (isRetryable && attempt < MAX_RETRIES) {
         await new Promise((r) => setTimeout(r, attempt * 5000));
