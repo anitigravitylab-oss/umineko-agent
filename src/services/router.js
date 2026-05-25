@@ -31,10 +31,23 @@ async function classifyOnce(userMessage, serverInfo) {
   });
 
   const raw = response.text ?? '';
-  const match = raw.match(/"type"\s*:\s*"(simple|complex)"/i);
-  if (!match) throw new Error(`No valid type in response: ${raw.slice(0, 100)}`);
 
-  return { type: match[1].toLowerCase(), reason: match[1].toLowerCase() };
+  // まず JSON.parse を試みる
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed.type === 'simple' || parsed.type === 'complex') {
+      return { type: parsed.type, reason: parsed.reason ?? parsed.type };
+    }
+  } catch (_) {
+    // JSON.parse 失敗時は正規表現フォールバック
+  }
+
+  // 正規表現で type と reason を個別に抽出
+  const typeMatch = raw.match(/"type"\s*:\s*"(simple|complex)"/i);
+  if (!typeMatch) throw new Error(`No valid type in response: ${raw.slice(0, 100)}`);
+  const reasonMatch = raw.match(/"reason"\s*:\s*"([^"]*)"/i);
+
+  return { type: typeMatch[1].toLowerCase(), reason: reasonMatch?.[1] ?? typeMatch[1].toLowerCase() };
 }
 
 export async function classify(userMessage, serverInfo = '') {

@@ -249,14 +249,26 @@ async function callAPI(messages, { model, tools } = {}) {
 
   const MAX_RETRIES = 3;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const res = await fetch(API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-      },
-      body: JSON.stringify(body),
-    });
+    let res;
+    try {
+      res = await fetch(API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000),
+      });
+    } catch (e) {
+      const isRetryable = e.name === 'AbortError' || e.name === 'TypeError';
+      console.warn(`[deepseek] fetch failed on attempt ${attempt}: ${e.message}`);
+      if (isRetryable && attempt < MAX_RETRIES) {
+        await new Promise((r) => setTimeout(r, attempt * 5000));
+        continue;
+      }
+      throw e;
+    }
 
     if (res.status === 503) {
       const wait = attempt * 5000; // 5s, 10s, 15s
@@ -581,7 +593,11 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall 
         choice.message.tool_calls.map(async (tc) => {
           const args = JSON.parse(tc.function.arguments);
           const result = await executeTool(tc.function.name, args, guild, aiChannelIds);
-          await onToolCall(toolLabel(tc.function.name, args, result));
+          try {
+            await onToolCall(toolLabel(tc.function.name, args, result));
+          } catch (e) {
+            console.warn(`[deepseek] onToolCall failed (UI only): ${e.message}`);
+          }
           return { tc, result };
         })
       );

@@ -240,7 +240,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     // ── 送信 ─────────────────────────────────────────────
-    const chunks = (response ?? '').match(/.{1,2000}/gs) ?? [];
+    const chunks = (response ?? '').match(/.{1,2000}/gsu) ?? [];
     for (const chunk of chunks) {
       await message.channel.send(chunk);
     }
