@@ -169,6 +169,14 @@ client.once(Events.ClientReady, async (c) => {
 });
 
 client.on(Events.GuildCreate, async (guild) => {
+  // Scan AI channels for newly joined guild
+  for (const [, channel] of guild.channels.cache) {
+    if (isAiChatChannel(channel)) {
+      aiChannelIds.add(channel.id);
+      console.log(`AI channel registered: #${channel.name} (${channel.id})`);
+    }
+  }
+  await ensureDefaultChannel(guild);
   await registerCommands(client.user.id, guild.id);
 });
 
