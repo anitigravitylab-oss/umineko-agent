@@ -50,6 +50,9 @@ const AI_COMMAND = {
         description: 'モデルを選択',
         required: true,
         choices: [
+          { name: 'Claude: Opus 4.8 (Max)',    value: 'claude-opus-4-8' },
+          { name: 'Claude: Sonnet 4.6 (Max)',  value: 'claude-sonnet-4-6' },
+          { name: 'Claude: Haiku 4.5 (Max)',   value: 'claude-haiku-4-5-20251001' },
           { name: 'OpenAI: gpt-5.5',          value: 'gpt-5.5' },
           { name: 'OpenAI: gpt-5.4',          value: 'gpt-5.4' },
           { name: 'OpenAI: gpt-5.4-mini',     value: 'gpt-5.4-mini' },
@@ -81,6 +84,7 @@ const AI_COMMAND = {
           { name: 'Gemini（デフォルト・高速）', value: 'gemini' },
           { name: 'DeepSeek', value: 'deepseek' },
           { name: 'OpenAI', value: 'openai' },
+          { name: 'Claude (Max)', value: 'claude' },
         ],
       }],
     },
@@ -276,7 +280,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } else {
       // モデル名からプロバイダーを自動推定
       let autoProvider = null;
-      if (/^gpt-|^o1|^o3|^o4/.test(value)) autoProvider = 'openai';
+      if (/^claude-/.test(value)) autoProvider = 'claude';
+      else if (/^gpt-|^o1|^o3|^o4/.test(value)) autoProvider = 'openai';
       else if (/^gemini-/.test(value)) autoProvider = 'gemini';
       else if (/^deepseek/.test(value)) autoProvider = 'deepseek';
 
