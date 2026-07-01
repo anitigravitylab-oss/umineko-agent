@@ -242,7 +242,12 @@ async function claudeFetch(body) {
           authorization: `Bearer ${token}`,
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(120000),
+        // Fable 5 / Sonnet 5 think on every call (adaptive-by-default when the
+        // `thinking` param is omitted, which we always do) and can legitimately
+        // take several minutes on demanding tool-loop turns — confirmed via a
+        // live 16k-max_tokens request that took ~165s. 120s was killing those
+        // requests mid-generation before the fix.
+        signal: AbortSignal.timeout(300000),
       });
     } catch (e) {
       lastErr = e;
@@ -292,7 +297,12 @@ async function claudeCallWithTools(messages, tools, { model, effort }) {
   const resolvedEffort = resolveClaudeEffort(effort, model);
   const data = await claudeFetch({
     model,
-    max_tokens: 4096,
+    // Fable 5 / Sonnet 5 spend part of this budget on always-on/adaptive
+    // thinking before writing any visible text — confirmed live that a
+    // demanding prompt can burn the entire 4096 on thinking alone, leaving
+    // an empty or truncated answer (stop_reason: max_tokens). 16000 leaves
+    // real headroom for both.
+    max_tokens: 16000,
     system: buildClaudeSystem(messages),
     tools: toClaudeTools(tools),
     messages: await toClaudeMessages(messages),
@@ -301,6 +311,9 @@ async function claudeCallWithTools(messages, tools, { model, effort }) {
   const blocks = data.content ?? [];
   const toolUse = blocks.filter((b) => b.type === 'tool_use');
   const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('');
+  if (toolUse.length === 0 && (!text || !text.trim())) {
+    console.warn(`[provider] Claude callWithTools returned empty (model=${model}, stop=${data.stop_reason})`);
+  }
 
   if (toolUse.length > 0) {
     const toolCalls = toolUse.map((b) => ({ id: b.id, name: b.name, arguments: b.input ?? {} }));
@@ -320,7 +333,11 @@ async function claudeCallWithTools(messages, tools, { model, effort }) {
 
 // ── callText: simple text completion, returns string ───────────────────
 // provider/model are optional — fall back to env vars if omitted
-export async function callText(messages, { maxTokens = 4096, provider, model, effort } = {}) {
+// Default raised 4096→16000: chatWithTools' followUp/final-answer calls rely
+// on this default, and Fable 5 / Sonnet 5's always-on/adaptive thinking can
+// burn 4096 entirely before writing any visible text (same bug fixed in
+// claudeCallWithTools; confirmed live in production logs on this exact path).
+export async function callText(messages, { maxTokens = 16000, provider, model, effort } = {}) {
   const { p, m } = resolveProviderModel(provider, model);
   // Collect ALL system messages (not just the first one)
   const systemMsgs = messages.filter((ms) => ms.role === 'system');
