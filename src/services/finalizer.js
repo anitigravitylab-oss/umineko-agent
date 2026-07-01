@@ -41,7 +41,7 @@ export async function finalizeResponse(userMessage, rawAnswer, history = [], set
           `## 回答\n${cleaned}`,
         ].filter(Boolean).join('\n\n'),
       },
-    ], { maxTokens: 2000, provider: settings.provider, model: settings.model });
+    ], { maxTokens: 2000, provider: settings.provider, model: settings.model, effort: settings.effort });
 
     const okMatch = raw.match(/"ok"\s*:\s*(true|false)/);
     const ok = okMatch?.[1] !== 'false';

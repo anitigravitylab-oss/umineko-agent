@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, renameSync } from 'fs';
-import { MODEL_DEFAULTS, ROUTER_MODEL_DEFAULTS } from './constants.js';
+import { MODEL_DEFAULTS, ROUTER_MODEL_DEFAULTS, EFFORT_LEVELS } from './constants.js';
 
 const SETTINGS_FILE = 'settings.json';
 
@@ -8,6 +8,7 @@ export const ENV_DEFAULTS = {
   model: process.env.AI_MODEL || null,
   routerProvider: (process.env.ROUTER_PROVIDER || 'gemini').toLowerCase(),
   routerModel: process.env.ROUTER_MODEL || null,
+  effort: (process.env.CLAUDE_EFFORT || 'max').toLowerCase(),
 };
 
 const store = (() => {
@@ -45,8 +46,12 @@ export function resolveModel(provider, modelOverride) {
   return modelOverride || MODEL_DEFAULTS[provider] || 'deepseek-chat';
 }
 
+export function resolveEffort(effortOverride) {
+  return effortOverride || ENV_DEFAULTS.effort;
+}
+
 export function resolveRouterModel(routerProvider, modelOverride) {
   return modelOverride || ROUTER_MODEL_DEFAULTS[routerProvider] || 'gemini-2.5-flash-lite';
 }
 
-export { MODEL_DEFAULTS, ROUTER_MODEL_DEFAULTS };
+export { MODEL_DEFAULTS, ROUTER_MODEL_DEFAULTS, EFFORT_LEVELS };

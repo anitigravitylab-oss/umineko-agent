@@ -140,7 +140,7 @@ export async function extractUserContext(userMessages, settings = {}) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const summary = await callText(msgs, {
-        maxTokens: 5000, provider: settings.provider, model: settings.model,
+        maxTokens: 5000, provider: settings.provider, model: settings.model, effort: settings.effort,
       });
       if (summary && summary.trim()) {
         console.log(`[research:user] extracted profile (${summary.length} chars, attempt ${attempt}): ${summary.slice(0, 120)}...`);
@@ -167,7 +167,7 @@ export async function planResearch(query, channelContext, settings = {}) {
     const raw = await callText([
       { role: 'system', content: PROMPT_PLAN },
       { role: 'user', content: prompt },
-    ], { maxTokens: 3000, provider: settings.provider, model: settings.model });
+    ], { maxTokens: 3000, provider: settings.provider, model: settings.model, effort: settings.effort });
 
     // JSONを抽出
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
@@ -209,6 +209,7 @@ export async function runResearch(query, contextText, settings = {}, onStatus = 
     const { content, toolCalls, rawMessage } = await callWithTools(msgs, WEB_ONLY_TOOLS, {
       provider: settings.provider,
       model: settings.model,
+      effort: settings.effort,
     });
 
     if (toolCalls) {
@@ -240,6 +241,7 @@ export async function runResearch(query, contextText, settings = {}, onStatus = 
     maxTokens: 16384,
     provider: settings.provider,
     model: settings.model,
+    effort: settings.effort,
   });
   return finalReport;
 }

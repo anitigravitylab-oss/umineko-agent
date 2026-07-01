@@ -4,6 +4,7 @@ import { Client, GatewayIntentBits, Events, ChannelType, REST, Routes } from 'di
 import { classify } from './services/router.js';
 import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from './services/llm.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
+import { extractImageUrls } from './services/attachments.js';
 import { planSearch } from './services/planner.js';
 import { finalizeResponse } from './services/finalizer.js';
 import { runResearch, planResearch, extractUserContext } from './services/research.js';
@@ -13,8 +14,10 @@ import {
   resetGuildSettings,
   resolveModel,
   resolveRouterModel,
+  resolveEffort,
   MODEL_DEFAULTS,
   ROUTER_MODEL_DEFAULTS,
+  EFFORT_LEVELS,
 } from './services/settings.js';
 
 const PORT = process.env.PORT || 8080;
@@ -50,6 +53,11 @@ const AI_COMMAND = {
         description: 'モデルを選択',
         required: true,
         choices: [
+          { name: 'Claude: Fable 5 (Max)',     value: 'claude-fable-5' },
+          { name: 'Claude: Opus 4.8 (Max)',    value: 'claude-opus-4-8' },
+          { name: 'Claude: Sonnet 5 (Max)',    value: 'claude-sonnet-5' },
+          { name: 'Claude: Sonnet 4.6 (Max)',  value: 'claude-sonnet-4-6' },
+          { name: 'Claude: Haiku 4.5 (Max)',   value: 'claude-haiku-4-5-20251001' },
           { name: 'OpenAI: gpt-5.5',          value: 'gpt-5.5' },
           { name: 'OpenAI: gpt-5.4',          value: 'gpt-5.4' },
           { name: 'OpenAI: gpt-5.4-mini',     value: 'gpt-5.4-mini' },
@@ -81,6 +89,7 @@ const AI_COMMAND = {
           { name: 'Gemini（デフォルト・高速）', value: 'gemini' },
           { name: 'DeepSeek', value: 'deepseek' },
           { name: 'OpenAI', value: 'openai' },
+          { name: 'Claude (Max)', value: 'claude' },
         ],
       }],
     },
@@ -93,6 +102,24 @@ const AI_COMMAND = {
         name: 'value',
         description: 'モデル名（例: gemini-2.5-flash-lite, gpt-4o-mini）',
         required: true,
+      }],
+    },
+    {
+      type: 1,
+      name: 'effort',
+      description: 'Claude使用時の思考の深さを変更（他プロバイダーでは無視されます）',
+      options: [{
+        type: 3,
+        name: 'value',
+        description: 'エフォートレベル',
+        required: true,
+        choices: [
+          { name: 'low（高速・低コスト）', value: 'low' },
+          { name: 'medium', value: 'medium' },
+          { name: 'high', value: 'high' },
+          { name: 'max（最高品質・デフォルト）', value: 'max' },
+          { name: '— デフォルトに戻す —', value: 'default' },
+        ],
       }],
     },
     {
@@ -261,11 +288,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const routerModel = resolveRouterModel(s.routerProvider, s.routerModel);
     const modelLabel = s.model ? `\`${s.model}\`` : `\`${mainModel}\` (デフォルト)`;
     const routerModelLabel = s.routerModel ? `\`${s.routerModel}\`` : `\`${routerModel}\` (デフォルト)`;
+    const effortLabel = `\`${s.effort}\``;
     await interaction.reply({
       content: [
         '**現在のAI設定**',
         `メインAI : \`${s.provider}\` / モデル: ${modelLabel}`,
         `ルーター  : \`${s.routerProvider}\` / モデル: ${routerModelLabel}`,
+        `Effort   : ${effortLabel}（Claude使用時のみ有効）`,
       ].join('\n'),
       ephemeral: true,
     });
@@ -284,7 +313,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } else {
       // モデル名からプロバイダーを自動推定
       let autoProvider = null;
-      if (/^gpt-|^o1|^o3|^o4/.test(value)) autoProvider = 'openai';
+      if (/^claude-/.test(value)) autoProvider = 'claude';
+      else if (/^gpt-|^o1|^o3|^o4/.test(value)) autoProvider = 'openai';
       else if (/^gemini-/.test(value)) autoProvider = 'gemini';
       else if (/^deepseek/.test(value)) autoProvider = 'deepseek';
 
@@ -335,6 +365,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (sub === 'effort') {
+    const value = interaction.options.getString('value');
+    if (value === 'default') {
+      updateGuildSettings(guildId, { effort: null });
+      await interaction.reply({
+        content: `✅ Effortをデフォルト (\`${resolveEffort(null)}\`) にリセットしました。`,
+        ephemeral: true,
+      });
+    } else {
+      updateGuildSettings(guildId, { effort: value });
+      await interaction.reply({
+        content: `✅ Effortを \`${value}\` に変更しました。（Claude使用時のみ有効。Haikuモデルでは自動的に無視されます）`,
+        ephemeral: true,
+      });
+    }
+    return;
+  }
+
   if (sub === 'reset') {
     const s = resetGuildSettings(guildId);
     await interaction.reply({
@@ -342,6 +390,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         '✅ 設定を環境変数のデフォルトに戻しました。',
         `メインAI : \`${s.provider}\` / モデル: \`${resolveModel(s.provider, s.model)}\``,
         `ルーター  : \`${s.routerProvider}\` / モデル: \`${resolveRouterModel(s.routerProvider, s.routerModel)}\``,
+        `Effort   : \`${resolveEffort(s.effort)}\``,
       ].join('\n'),
       ephemeral: true,
     });
@@ -487,6 +536,7 @@ client.on(Events.MessageCreate, async (message) => {
   if (!message.guild || !isGuildAllowed(message.guild.id)) return;
   if (!aiChannelIds.has(message.channelId)) return;
 
+  const userImages = extractImageUrls(message);
   const settings = getGuildSettings(message.guild.id);
   const modelDisplay = `${settings.provider}/${resolveModel(settings.provider, settings.model)}`;
 
@@ -553,7 +603,7 @@ client.on(Events.MessageCreate, async (message) => {
       const msgs = [
         { role: 'system', content: `${timeContext}\n\n${systemPrompt}` },
         ...history,
-        { role: 'user', content: message.content },
+        { role: 'user', content: message.content, ...(userImages.length ? { images: userImages } : {}) },
       ];
 
       const onToolCall = async (label) => {
@@ -615,7 +665,7 @@ client.on(Events.MessageCreate, async (message) => {
       const msgs = [
         { role: 'system', content: `${timeContext}\n\n${SYSTEM_SIMPLE}` },
         ...history,
-        { role: 'user', content: message.content },
+        { role: 'user', content: message.content, ...(userImages.length ? { images: userImages } : {}) },
       ];
       response = await chatSimple(msgs, settings);
     }
