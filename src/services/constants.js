@@ -13,3 +13,5 @@ export const ROUTER_MODEL_DEFAULTS = {
 };
 
 export const PROVIDERS = ['deepseek', 'openai', 'gemini', 'claude'];
+
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'max'];

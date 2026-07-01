@@ -127,17 +127,54 @@ function toClaudeTools(tools) {
   }));
 }
 
+// NOTE: Anthropic's `image.source.type: 'url'` (server-side fetch) reliably
+// fails with "Unable to download the file" over this bot's OAuth/Max-subscription
+// auth path (anthropic-beta: oauth-2025-04-20), even for public, reachable URLs —
+// confirmed via direct API testing. Fetching the bytes ourselves and sending
+// base64 works reliably, so we do that instead.
+const MAX_IMAGE_FETCH_BYTES = 8 * 1024 * 1024; // 8MB safety cap
+
+function guessImageMediaType(url) {
+  const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
+  if (ext === 'png') return 'image/png';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'webp') return 'image/webp';
+  return 'image/jpeg';
+}
+
+async function fetchImageAsBase64(url) {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_IMAGE_FETCH_BYTES) throw new Error(`image too large (${buf.length} bytes)`);
+    const mediaType = res.headers.get('content-type')?.split(';')[0] || guessImageMediaType(url);
+    return { mediaType, data: buf.toString('base64') };
+  } catch (e) {
+    console.warn(`[provider] Claude image fetch failed for ${url.slice(0, 100)}: ${e.message}`);
+    return null;
+  }
+}
+
 // Convert OpenAI-format messages → Anthropic messages.
 // - system messages are handled separately (buildClaudeSystem)
 // - assistant tool_calls → tool_use content blocks
 // - tool results → user message with tool_result blocks
-function toClaudeMessages(messages) {
+async function toClaudeMessages(messages) {
   const raw = [];
   for (const msg of messages) {
     if (msg.role === 'system') continue;
     if (msg.role === 'user') {
       const text = (msg.content ?? '').toString();
-      if (text.trim()) raw.push({ role: 'user', content: [{ type: 'text', text }] });
+      const blocks = [];
+      if (text.trim()) blocks.push({ type: 'text', text });
+      if (msg.images?.length) {
+        const fetched = await Promise.all(msg.images.map(fetchImageAsBase64));
+        for (const img of fetched) {
+          if (img) blocks.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } });
+        }
+      }
+      if (blocks.length) raw.push({ role: 'user', content: blocks });
     } else if (msg.role === 'assistant') {
       const blocks = [];
       if (msg.content && msg.content.toString().trim()) {
@@ -166,12 +203,31 @@ function toClaudeMessages(messages) {
   // Anthropic requires the conversation to start with a user message.
   while (merged.length && merged[0].role === 'assistant') merged.shift();
   if (merged.length === 0) merged.push({ role: 'user', content: [{ type: 'text', text: '(no content)' }] });
+  // Anthropic rejects a conversation ending on 'assistant' (no prefill support).
+  // This happens when a trailing system-role message (e.g. an internal retry
+  // instruction) gets filtered out above, leaving the prior assistant turn last.
+  // The instruction still reaches Claude via buildClaudeSystem — this just
+  // anchors the conversation back onto a valid trailing user turn.
+  if (merged[merged.length - 1].role === 'assistant') {
+    merged.push({ role: 'user', content: [{ type: 'text', text: '続けてください。' }] });
+  }
   return merged;
 }
+
+// Claude Fable 5 has more active safety classifiers than Opus/Sonnet-tier
+// models and can decline benign-adjacent requests (stop_reason: "refusal").
+// Anthropic recommends opting into server-side fallback by default so a
+// refusal is transparently retried on Opus 4.8 within the same request.
+const FABLE5_MODEL = 'claude-fable-5';
 
 async function claudeFetch(body) {
   const token = getClaudeToken();
   if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is not set');
+  const betas = ['oauth-2025-04-20'];
+  if (body.model === FABLE5_MODEL) {
+    betas.push('server-side-fallback-2026-06-01');
+    body = { ...body, fallbacks: [{ model: 'claude-opus-4-8' }] };
+  }
   const MAX_RETRIES = 3;
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -182,7 +238,7 @@ async function claudeFetch(body) {
         headers: {
           'content-type': 'application/json',
           'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'oauth-2025-04-20',
+          'anthropic-beta': betas.join(','),
           authorization: `Bearer ${token}`,
         },
         body: JSON.stringify(body),
@@ -206,12 +262,21 @@ async function claudeFetch(body) {
   throw lastErr ?? new Error('claudeFetch failed after retries');
 }
 
-async function claudeCallText(messages, { maxTokens, model }) {
+const DEFAULT_CLAUDE_EFFORT = (process.env.CLAUDE_EFFORT || 'max').toLowerCase();
+
+function resolveClaudeEffort(effort, model) {
+  if (/haiku/i.test(model)) return null; // Haiku は effort 非対応。送らない
+  return (effort || DEFAULT_CLAUDE_EFFORT).toLowerCase();
+}
+
+async function claudeCallText(messages, { maxTokens, model, effort }) {
+  const resolvedEffort = resolveClaudeEffort(effort, model);
   const data = await claudeFetch({
     model,
     max_tokens: maxTokens,
     system: buildClaudeSystem(messages),
-    messages: toClaudeMessages(messages),
+    messages: await toClaudeMessages(messages),
+    ...(resolvedEffort ? { output_config: { effort: resolvedEffort } } : {}),
   });
   const text = (data.content ?? [])
     .filter((b) => b.type === 'text')
@@ -223,13 +288,15 @@ async function claudeCallText(messages, { maxTokens, model }) {
   return text;
 }
 
-async function claudeCallWithTools(messages, tools, { model }) {
+async function claudeCallWithTools(messages, tools, { model, effort }) {
+  const resolvedEffort = resolveClaudeEffort(effort, model);
   const data = await claudeFetch({
     model,
     max_tokens: 4096,
     system: buildClaudeSystem(messages),
     tools: toClaudeTools(tools),
-    messages: toClaudeMessages(messages),
+    messages: await toClaudeMessages(messages),
+    ...(resolvedEffort ? { output_config: { effort: resolvedEffort } } : {}),
   });
   const blocks = data.content ?? [];
   const toolUse = blocks.filter((b) => b.type === 'tool_use');
@@ -253,14 +320,14 @@ async function claudeCallWithTools(messages, tools, { model }) {
 
 // ── callText: simple text completion, returns string ───────────────────
 // provider/model are optional — fall back to env vars if omitted
-export async function callText(messages, { maxTokens = 4096, provider, model } = {}) {
+export async function callText(messages, { maxTokens = 4096, provider, model, effort } = {}) {
   const { p, m } = resolveProviderModel(provider, model);
   // Collect ALL system messages (not just the first one)
   const systemMsgs = messages.filter((ms) => ms.role === 'system');
   const systemInstruction = systemMsgs.map((ms) => ms.content).join('\n\n') || undefined;
 
   if (p === 'claude') {
-    return claudeCallText(messages, { maxTokens, model: m });
+    return claudeCallText(messages, { maxTokens, model: m, effort });
   }
 
   if (p === 'gemini') {
@@ -290,7 +357,7 @@ export async function callText(messages, { maxTokens = 4096, provider, model } =
   const tokenParam = p === 'openai' ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens };
   const completion = await getOpenAIClient(p).chat.completions.create({
     model: m,
-    messages,
+    messages: messages.map(({ images, ...rest }) => rest),
     ...tokenParam,
   });
   const content = completion.choices?.[0]?.message?.content ?? '';
@@ -304,11 +371,11 @@ export async function callText(messages, { maxTokens = 4096, provider, model } =
 // Returns { content, toolCalls, rawMessage }
 // toolCalls: [{id, name, arguments: object}] | null
 // rawMessage: OpenAI-format assistant message to push into msgs
-export async function callWithTools(messages, tools, { provider, model } = {}) {
+export async function callWithTools(messages, tools, { provider, model, effort } = {}) {
   const { p, m } = resolveProviderModel(provider, model);
 
   if (p === 'claude') {
-    return claudeCallWithTools(messages, tools, { model: m });
+    return claudeCallWithTools(messages, tools, { model: m, effort });
   }
 
   if (p === 'gemini') {
@@ -378,7 +445,7 @@ export async function callWithTools(messages, tools, { provider, model } = {}) {
       const tokenParam = p === 'openai' ? { max_completion_tokens: 4096 } : { max_tokens: 4096 };
       completion = await getOpenAIClient(p).chat.completions.create({
         model: m,
-        messages,
+        messages: messages.map(({ images, ...rest }) => rest),
         tools,
         ...tokenParam,
       });

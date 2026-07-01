@@ -23,7 +23,7 @@ export async function planSearch(userMessage, channelList, history = [], setting
     const raw = await callText([
       { role: 'system', content: SYSTEM },
       { role: 'user', content: `${historyText}## 利用可能なチャンネル\n${channelList}\n\n## 今回の指示\n${userMessage}` },
-    ], { maxTokens: 300, provider: settings.provider, model: settings.model });
+    ], { maxTokens: 300, provider: settings.provider, model: settings.model, effort: settings.effort });
 
     const channelsMatch = raw.match(/"channels"\s*:\s*\[([^\]]*)\]/);
     const channels = channelsMatch

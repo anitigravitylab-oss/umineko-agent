@@ -1,3 +1,5 @@
+import { extractImageUrls } from './attachments.js';
+
 const HISTORY_LIMIT = 50;
 
 export async function buildConversationHistory(channel, currentMessageId, botUserId) {
@@ -14,10 +16,14 @@ export async function buildConversationHistory(channel, currentMessageId, botUse
       return true;
     })
     .slice(-HISTORY_LIMIT)
-    .map((m) => ({
-      role: m.author.id === botUserId ? 'assistant' : 'user',
-      content: m.content,
-    }));
+    .map((m) => {
+      const images = extractImageUrls(m);
+      return {
+        role: m.author.id === botUserId ? 'assistant' : 'user',
+        content: m.content,
+        ...(images.length ? { images } : {}),
+      };
+    });
 
   return history;
 }

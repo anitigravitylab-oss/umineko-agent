@@ -1,5 +1,6 @@
 import { ChannelType } from 'discord.js';
 import { callText, callWithTools as providerCallWithTools } from './provider.js';
+import { extractImageUrls } from './attachments.js';
 
 const MAX_ITERATIONS = 10;
 
@@ -245,8 +246,9 @@ async function executeTool(name, args, guild, aiChannelIds) {
   } catch (e) {
     result = `エラー: ${e.message}`;
   }
-  console.log(`[tool] ${name} → ${result.slice(0, 100)}`);
-  return result;
+  const normalized = typeof result === 'string' ? { text: result, images: [] } : result;
+  console.log(`[tool] ${name} → ${normalized.text.slice(0, 100)}`);
+  return normalized;
 }
 
 async function executeToolInner(name, args, guild, aiChannelIds) {
@@ -257,12 +259,13 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
       );
       if (!channel) return `チャンネル #${args.channel_name} が見つかりませんでした。`;
       const fetched = await channel.messages.fetch({ limit: 50 });
-      const lines = [...fetched.values()]
-        .reverse()
+      const msgList = [...fetched.values()].reverse();
+      const lines = msgList
         .filter((m) => m.content.trim())
         .map((m) => `[${m.id}] ${m.author.username}(メンション:<@${m.author.id}>): ${m.content}`)
         .join('\n');
-      return lines || '(メッセージなし)';
+      const images = msgList.flatMap((m) => extractImageUrls(m));
+      return { text: lines || '(メッセージなし)', images };
     }
 
     case 'send_message': {
@@ -400,16 +403,21 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
       if (!channel) return `チャンネルID ${channelId} が見つかりませんでした。`;
       if (!messageId) {
         const fetched = await channel.messages.fetch({ limit: 20 });
-        const lines = [...fetched.values()]
-          .reverse()
+        const msgList = [...fetched.values()].reverse();
+        const lines = msgList
           .filter((m) => m.content.trim())
           .map((m) => `[${m.id}] ${m.author.username}(メンション:<@${m.author.id}>): ${m.content}`)
           .join('\n');
-        return `#${channel.name} の最近のメッセージ:\n${lines || '(メッセージなし)'}`;
+        const images = msgList.flatMap((m) => extractImageUrls(m));
+        return { text: `#${channel.name} の最近のメッセージ:\n${lines || '(メッセージなし)'}`, images };
       }
       try {
         const msg = await channel.messages.fetch(messageId);
-        return `チャンネル: #${channel.name}\n送信者: ${msg.author.username}(メンション:<@${msg.author.id}>)\n内容: ${msg.content}\nリンク: https://discord.com/channels/${guild.id}/${channelId}/${messageId}`;
+        const images = extractImageUrls(msg);
+        return {
+          text: `チャンネル: #${channel.name}\n送信者: ${msg.author.username}(メンション:<@${msg.author.id}>)\n内容: ${msg.content}\nリンク: https://discord.com/channels/${guild.id}/${channelId}/${messageId}`,
+          images,
+        };
       } catch (e) {
         return `メッセージ取得失敗: ${e.message}`;
       }
@@ -490,7 +498,7 @@ function toolLabel(name, args, result) {
 
 // settings: { provider, model } — optional, falls back to env vars
 export async function chatSimple(messages, settings = {}) {
-  return callText(messages, { provider: settings.provider, model: settings.model });
+  return callText(messages, { provider: settings.provider, model: settings.model, effort: settings.effort });
 }
 
 export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall, settings = {} }) {
@@ -501,6 +509,7 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall,
     const { content, toolCalls, rawMessage } = await providerCallWithTools(msgs, TOOLS, {
       provider: settings.provider,
       model: settings.model,
+      effort: settings.effort,
     });
 
     if (toolCalls) {
@@ -509,19 +518,25 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall,
       const toolResults = await Promise.all(
         toolCalls.map(async (tc) => {
           const result = await executeTool(tc.name, tc.arguments, guild, aiChannelIds);
-          await onToolCall(toolLabel(tc.name, tc.arguments, result)).catch(() => {});
+          await onToolCall(toolLabel(tc.name, tc.arguments, result.text)).catch(() => {});
           return { tc, result };
         })
       );
 
       for (const { tc, result } of toolResults) {
-        msgs.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        msgs.push({ role: 'tool', tool_call_id: tc.id, content: result.text });
       }
+
+      const roundImages = toolResults.flatMap(({ result }) => result.images || []).slice(0, 4);
+      if (roundImages.length > 0) {
+        msgs.push({ role: 'user', content: '(上記ツール結果に含まれる添付画像)', images: roundImages });
+      }
+
       iterations += 1;
     } else {
       if (!content || !content.trim()) {
         msgs.push({ role: 'user', content: 'ツールの実行結果を踏まえて、ユーザーへの回答を生成してください。' });
-        const followUp = await callText(msgs, { provider: settings.provider, model: settings.model });
+        const followUp = await callText(msgs, { provider: settings.provider, model: settings.model, effort: settings.effort });
         return { answer: followUp, msgs };
       }
       return { answer: content, msgs };
@@ -529,10 +544,10 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall,
   }
 
   msgs.push({ role: 'user', content: '収集した情報をもとに、最初の質問に答えてください。' });
-  const answer = await callText(msgs, { provider: settings.provider, model: settings.model });
+  const answer = await callText(msgs, { provider: settings.provider, model: settings.model, effort: settings.effort });
   return { answer, msgs };
 }
 
 export async function generateFinal(messages, settings = {}) {
-  return callText(messages, { provider: settings.provider, model: settings.model });
+  return callText(messages, { provider: settings.provider, model: settings.model, effort: settings.effort });
 }
