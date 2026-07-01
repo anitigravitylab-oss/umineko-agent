@@ -616,6 +616,7 @@ client.on(Events.MessageCreate, async (message) => {
         aiChannelIds,
         onToolCall,
         settings,
+        member: message.member,
       });
 
       // ── Step 5: Finalize ──────────────────────────────────
@@ -654,6 +655,7 @@ client.on(Events.MessageCreate, async (message) => {
             await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[AI]** 処理中...']));
           },
           settings,
+          member: message.member,
         });
         response = retryAnswer;
       }

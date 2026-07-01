@@ -238,8 +238,17 @@ const TOOLS = WEB_SEARCH_ENABLED ? [...DISCORD_TOOLS, ...WEB_TOOLS_DEFS] : DISCO
 
 const WINDOWS_API = `http://${process.env.WINDOWS_API_HOST || 'localhost'}:7654`;
 
-async function executeTool(name, args, guild, aiChannelIds) {
+const ADMIN_TOOLS = new Set([
+  'create_channel', 'edit_channel',
+  'create_category', 'edit_category',
+]);
+
+async function executeTool(name, args, guild, aiChannelIds, member) {
   console.log(`[tool] ${name} ${JSON.stringify(args)}`);
+  if (ADMIN_TOOLS.has(name) && member && !member.permissions.has('Administrator')) {
+    console.log(`[tool] ${name} blocked — user ${member.user.username} is not admin`);
+    return { text: `権限エラー: \`${name}\` は管理者のみ実行できます。`, images: [] };
+  }
   let result;
   try {
     result = await executeToolInner(name, args, guild, aiChannelIds);
@@ -501,7 +510,7 @@ export async function chatSimple(messages, settings = {}) {
   return callText(messages, { provider: settings.provider, model: settings.model, effort: settings.effort });
 }
 
-export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall, settings = {} }) {
+export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall, settings = {}, member = null }) {
   const msgs = [...messages];
   let iterations = 0;
 
@@ -517,7 +526,7 @@ export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall,
 
       const toolResults = await Promise.all(
         toolCalls.map(async (tc) => {
-          const result = await executeTool(tc.name, tc.arguments, guild, aiChannelIds);
+          const result = await executeTool(tc.name, tc.arguments, guild, aiChannelIds, member);
           await onToolCall(toolLabel(tc.name, tc.arguments, result.text)).catch(() => {});
           return { tc, result };
         })
