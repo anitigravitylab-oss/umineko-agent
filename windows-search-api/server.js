@@ -24,14 +24,21 @@ app.get('/search', async (req, res) => {
 
     await page.goto(
       `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=ja&cc=JP&count=10`,
-      { waitUntil: 'networkidle', timeout: 20000 }
+      { waitUntil: 'domcontentloaded', timeout: 20000 }
     );
-    await page.waitForSelector('#b_results', { timeout: 10000 }).catch(() => {});
+    // #b_results is visibility:hidden until Bing's per-result stylesheets finish
+    // loading, so the default (visible-state) waitForSelector always timed out.
+    // Wait for the item itself to be attached to the DOM instead — visibility
+    // doesn't matter for scraping text out of it.
+    await page.waitForSelector('#b_results .b_algo', { state: 'attached', timeout: 10000 }).catch(() => {});
 
     const results = await page.evaluate(() => {
+      // textContent, not innerText: innerText returns '' for elements under a
+      // visibility:hidden ancestor (#b_results), even though the real text is
+      // present in the DOM.
       return [...document.querySelectorAll('#b_results .b_algo')].slice(0, 10).map(el => ({
-        title: el.querySelector('h2')?.innerText?.trim() ?? '',
-        snippet: el.querySelector('.b_caption p, .b_algoSlug')?.innerText?.trim() ?? '',
+        title: el.querySelector('h2')?.textContent?.trim() ?? '',
+        snippet: el.querySelector('.b_caption p, .b_algoSlug')?.textContent?.trim() ?? '',
         url: el.querySelector('h2 a')?.href ?? '',
       })).filter(r => r.title && r.url);
     });
