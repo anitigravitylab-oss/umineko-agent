@@ -5,14 +5,16 @@ import { ChannelType } from 'discord.js';
 // プロンプトキャッシュの対象にし、毎分変わる時刻をキャッシュ境界の
 // 後ろに置くため（provider.js の各セッションが配置を決める）。
 const AI_MEMORY_CHANNEL_NAME = 'ai-memory';
+const AI_CONFIG_CHANNEL_NAME = 'ai-config';
 
-export function buildSystemPrompt(guild, aiChannelIds, { mode } = {}) {
+export function buildSystemPrompt(guild, aiChannelIds, { mode, custom } = {}) {
   const channelList = guild.channels.cache
     .filter((c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id))
     .map((c) => {
       const topicPart = c.topic ? ` (${c.topic})` : '';
       const memoryNote = c.name === AI_MEMORY_CHANNEL_NAME ? ' (あなたの長期記憶)' : '';
-      return `#${c.name} [ID:${c.id}]${topicPart}${memoryNote}`;
+      const configNote = c.name === AI_CONFIG_CHANNEL_NAME ? ' (ペルソナ設定)' : '';
+      return `#${c.name} [ID:${c.id}]${topicPart}${memoryNote}${configNote}`;
     })
     .join('\n');
 
@@ -55,6 +57,14 @@ ${channelList || '(なし)'}
 - ユーザーに「覚えて」と言われたとき、または会話でサーバーに関する持続的な事実（好み・決定・役割）を得たときは、#ai-memory に send_message で保存する。1メッセージ=1事実、簡潔に。
 - 古くなった記憶は delete_message（自分のメッセージのみ可）で消してから書き直す。
 - #ai-memory への send_message と自分のメッセージの delete_message に限り、「変更系ツールは明示依頼時のみ」の例外として、明示依頼がなくても自律的に使ってよい。`;
+  }
+
+  if (custom && custom.trim()) {
+    persona += `
+
+## サーバー独自設定（#ai-config より・サーバー管理者が設定）
+以下はこのサーバーの管理者による指示。上の一般原則と矛盾する場合はこちらを優先する:
+${custom.trim()}`;
   }
 
   if (mode === 'research') {
