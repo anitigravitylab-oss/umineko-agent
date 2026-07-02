@@ -1,31 +1,5 @@
 import { ChannelType } from 'discord.js';
-import { callText, callWithTools as providerCallWithTools } from './provider.js';
 import { extractImageUrls } from './attachments.js';
-
-const MAX_ITERATIONS = 10;
-
-export const SYSTEM_SIMPLE = `あなたはDiscordサーバーのAIアシスタントです。
-messages配列には過去の会話履歴が含まれています。それを参照しながら最後のuserメッセージに答えてください。
-ユーザーと同じ言語で回答してください。`;
-
-export const buildSystemWithTools = (channelList) =>
-  `あなたはDiscordサーバーのAIアシスタントです。
-messages配列には過去の会話履歴が含まれています。
-ツールを使ってチャンネルの読み書きや管理を行ってから回答してください。
-ユーザーと同じ言語で回答してください。
-
-【重要】新しいAIチャットスペース（会話用チャンネル）を作成する場合は、チャンネル名を必ず "ai-" で始めること（例: ai-general, ai-work）。
-"ai-" で始まるチャンネルは自動的にAIチャットチャンネルとして認識され、そこでもAIと会話できるようになる。
-
-【Discordのフォーマットルール】
-- ユーザーメンション: <@数字ID> ← 必ず数字ID。<@ユーザー名> は機能しない
-- チャンネルリンク: <#チャンネルID> ← クリッカブルになる。チャンネルIDは下記リストに記載
-- メッセージリンク: https://discord.com/channels/{サーバーID}/{チャンネルID}/{メッセージID}
-- ロールメンション: <@&ロールID>
-- ユーザー/チャンネルのIDは必ずツール結果か下記リストから取得すること。推測・捏造禁止
-
-利用可能なチャンネル:
-${channelList}`;
 
 const WEB_SEARCH_ENABLED = process.env.WEB_SEARCH_ENABLED !== 'false';
 
@@ -234,7 +208,7 @@ const WEB_TOOLS_DEFS = [
   },
 ];
 
-const TOOLS = WEB_SEARCH_ENABLED ? [...DISCORD_TOOLS, ...WEB_TOOLS_DEFS] : DISCORD_TOOLS;
+export const TOOLS = WEB_SEARCH_ENABLED ? [...DISCORD_TOOLS, ...WEB_TOOLS_DEFS] : DISCORD_TOOLS;
 
 const WINDOWS_API = `http://${process.env.WINDOWS_API_HOST || 'localhost'}:7654`;
 
@@ -243,7 +217,7 @@ const ADMIN_TOOLS = new Set([
   'create_category', 'edit_category',
 ]);
 
-async function executeTool(name, args, guild, aiChannelIds, member) {
+export async function executeTool(name, args, guild, aiChannelIds, member) {
   console.log(`[tool] ${name} ${JSON.stringify(args)}`);
   if (ADMIN_TOOLS.has(name) && member && !member.permissions.has('Administrator')) {
     console.log(`[tool] ${name} blocked — user ${member.user.username} is not admin`);
@@ -485,7 +459,7 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
   }
 }
 
-function toolLabel(name, args, result) {
+export function toolLabel(name, args, result) {
   switch (name) {
     case 'read_channel': return `\`read_channel("${args.channel_name}")\` → ${result.split('\n').filter(Boolean).length}件`;
     case 'send_message': return `\`send_message("${args.channel_name}")\` → 送信完了`;
@@ -503,60 +477,4 @@ function toolLabel(name, args, result) {
     case 'fetch_url': return `\`fetch_url("${args.url.slice(0, 50)}...")\``;
     default: return `\`${name}\` → ${result}`;
   }
-}
-
-// settings: { provider, model } — optional, falls back to env vars
-export async function chatSimple(messages, settings = {}) {
-  return callText(messages, { provider: settings.provider, model: settings.model, effort: settings.effort });
-}
-
-export async function chatWithTools(messages, { guild, aiChannelIds, onToolCall, settings = {}, member = null }) {
-  const msgs = [...messages];
-  let iterations = 0;
-
-  while (iterations < MAX_ITERATIONS) {
-    const { content, toolCalls, rawMessage } = await providerCallWithTools(msgs, TOOLS, {
-      provider: settings.provider,
-      model: settings.model,
-      effort: settings.effort,
-    });
-
-    if (toolCalls) {
-      msgs.push(rawMessage);
-
-      const toolResults = await Promise.all(
-        toolCalls.map(async (tc) => {
-          const result = await executeTool(tc.name, tc.arguments, guild, aiChannelIds, member);
-          await onToolCall(toolLabel(tc.name, tc.arguments, result.text)).catch(() => {});
-          return { tc, result };
-        })
-      );
-
-      for (const { tc, result } of toolResults) {
-        msgs.push({ role: 'tool', tool_call_id: tc.id, content: result.text });
-      }
-
-      const roundImages = toolResults.flatMap(({ result }) => result.images || []).slice(0, 4);
-      if (roundImages.length > 0) {
-        msgs.push({ role: 'user', content: '(上記ツール結果に含まれる添付画像)', images: roundImages });
-      }
-
-      iterations += 1;
-    } else {
-      if (!content || !content.trim()) {
-        msgs.push({ role: 'user', content: 'ツールの実行結果を踏まえて、ユーザーへの回答を生成してください。' });
-        const followUp = await callText(msgs, { provider: settings.provider, model: settings.model, effort: settings.effort });
-        return { answer: followUp, msgs };
-      }
-      return { answer: content, msgs };
-    }
-  }
-
-  msgs.push({ role: 'user', content: '収集した情報をもとに、最初の質問に答えてください。' });
-  const answer = await callText(msgs, { provider: settings.provider, model: settings.model, effort: settings.effort });
-  return { answer, msgs };
-}
-
-export async function generateFinal(messages, settings = {}) {
-  return callText(messages, { provider: settings.provider, model: settings.model, effort: settings.effort });
 }

@@ -1,23 +1,16 @@
 import 'dotenv/config';
 import http from 'http';
 import { Client, GatewayIntentBits, Events, ChannelType, REST, Routes } from 'discord.js';
-import { classify } from './services/router.js';
-import { chatSimple, chatWithTools, SYSTEM_SIMPLE, buildSystemWithTools } from './services/llm.js';
+import { runAgent } from './services/agent.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { extractImageUrls } from './services/attachments.js';
-import { planSearch } from './services/planner.js';
-import { finalizeResponse } from './services/finalizer.js';
-import { runResearch, planResearch, extractUserContext } from './services/research.js';
 import {
   getGuildSettings,
   updateGuildSettings,
   resetGuildSettings,
   resolveModel,
-  resolveRouterModel,
   resolveEffort,
   MODEL_DEFAULTS,
-  ROUTER_MODEL_DEFAULTS,
-  EFFORT_LEVELS,
 } from './services/settings.js';
 
 const PORT = process.env.PORT || 8080;
@@ -74,34 +67,6 @@ const AI_COMMAND = {
           { name: 'DeepSeek: v4-flash',       value: 'deepseek-v4-flash' },
           { name: '— デフォルトに戻す —',       value: 'default' },
         ],
-      }],
-    },
-    {
-      type: 1,
-      name: 'router',
-      description: 'simple/complex 判定に使うプロバイダーを変更',
-      options: [{
-        type: 3,
-        name: 'value',
-        description: 'プロバイダー名',
-        required: true,
-        choices: [
-          { name: 'Gemini（デフォルト・高速）', value: 'gemini' },
-          { name: 'DeepSeek', value: 'deepseek' },
-          { name: 'OpenAI', value: 'openai' },
-          { name: 'Claude (Max)', value: 'claude' },
-        ],
-      }],
-    },
-    {
-      type: 1,
-      name: 'router-model',
-      description: 'ルーターのモデル名を変更（"default" でリセット）',
-      options: [{
-        type: 3,
-        name: 'value',
-        description: 'モデル名（例: gemini-2.5-flash-lite, gpt-4o-mini）',
-        required: true,
       }],
     },
     {
@@ -262,17 +227,43 @@ async function ensureDefaultChannel(guild) {
   }
 }
 
-function formatStatus(lines) {
-  return lines.join('\n');
+// ── メッセージ分割（2000字以内・段落境界優先） ──────────────────────────
+const MAX_CHUNK = 2000;
+
+function splitByLimit(text, separators) {
+  if (text.length <= MAX_CHUNK) return [text];
+  const [sep, ...rest] = separators;
+  // 区切りを使い切ったら文字単位で切る（コードポイント単位・現行の正規表現を踏襲）
+  if (!sep) return text.match(/.{1,2000}/gsu) ?? [];
+  const out = [];
+  let current = '';
+  for (const part of text.split(sep)) {
+    const candidate = current ? current + sep + part : part;
+    if (candidate.length <= MAX_CHUNK) {
+      current = candidate;
+      continue;
+    }
+    if (current) out.push(current);
+    if (part.length <= MAX_CHUNK) {
+      current = part;
+    } else {
+      out.push(...splitByLimit(part, rest));
+      current = '';
+    }
+  }
+  if (current) out.push(current);
+  return out;
 }
 
-function buildServerInfo(guild) {
-  const channels = guild.channels.cache
-    .filter((c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id))
-    .map((c) => `#${c.name}`)
-    .join(', ');
-  return `サーバー名: ${guild.name}\nチャンネル一覧: ${channels}`;
+// 段落境界(\n\n)優先で2000字以内のチャンクに分割する。
+// 段落単体が2000超なら行(\n)、それも超えるなら文字で切る。
+export function chunkMessage(text) {
+  const t = (text ?? '').trim();
+  if (!t) return [];
+  return splitByLimit(t, ['\n\n', '\n']).map((c) => c.trim()).filter(Boolean);
 }
+
+const renderStatus = (lines) => lines.join('\n').slice(0, 2000);
 
 // ── スラッシュコマンドハンドラー ──────────────────────────────────────
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -285,16 +276,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (sub === 'status') {
     const s = getGuildSettings(guildId);
     const mainModel = resolveModel(s.provider, s.model);
-    const routerModel = resolveRouterModel(s.routerProvider, s.routerModel);
     const modelLabel = s.model ? `\`${s.model}\`` : `\`${mainModel}\` (デフォルト)`;
-    const routerModelLabel = s.routerModel ? `\`${s.routerModel}\`` : `\`${routerModel}\` (デフォルト)`;
-    const effortLabel = `\`${s.effort}\``;
     await interaction.reply({
       content: [
         '**現在のAI設定**',
         `メインAI : \`${s.provider}\` / モデル: ${modelLabel}`,
-        `ルーター  : \`${s.routerProvider}\` / モデル: ${routerModelLabel}`,
-        `Effort   : ${effortLabel}（Claude使用時のみ有効）`,
+        `Effort   : \`${s.effort}\`（Claude使用時のみ有効）`,
       ].join('\n'),
       ephemeral: true,
     });
@@ -326,39 +313,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const s = getGuildSettings(guildId);
       const providerNote = patch.provider
         ? `\nプロバイダーも \`${patch.provider}\` に自動変更しました。`
-        : `\n現在のプロバイダー: \`${s.provider}\`（変更は \`/ai provider\` で）`;
+        : `\n現在のプロバイダー: \`${s.provider}\``;
       await interaction.reply({
         content: `✅ モデルを \`${value}\` に変更しました。${providerNote}`,
-        ephemeral: true,
-      });
-    }
-    return;
-  }
-
-  if (sub === 'router') {
-    const value = interaction.options.getString('value');
-    updateGuildSettings(guildId, { routerProvider: value, routerModel: null });
-    const defaultModel = ROUTER_MODEL_DEFAULTS[value] ?? '?';
-    await interaction.reply({
-      content: `✅ ルーターを \`${value}\` に変更しました。\nデフォルトモデル: \`${defaultModel}\``,
-      ephemeral: true,
-    });
-    return;
-  }
-
-  if (sub === 'router-model') {
-    const value = interaction.options.getString('value');
-    if (value === 'default') {
-      updateGuildSettings(guildId, { routerModel: null });
-      const s = getGuildSettings(guildId);
-      await interaction.reply({
-        content: `✅ ルーターモデルをデフォルト (\`${ROUTER_MODEL_DEFAULTS[s.routerProvider] ?? '?'}\`) にリセットしました。`,
-        ephemeral: true,
-      });
-    } else {
-      updateGuildSettings(guildId, { routerModel: value });
-      await interaction.reply({
-        content: `✅ ルーターのモデルを \`${value}\` に変更しました。`,
         ephemeral: true,
       });
     }
@@ -389,7 +346,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       content: [
         '✅ 設定を環境変数のデフォルトに戻しました。',
         `メインAI : \`${s.provider}\` / モデル: \`${resolveModel(s.provider, s.model)}\``,
-        `ルーター  : \`${s.routerProvider}\` / モデル: \`${resolveRouterModel(s.routerProvider, s.routerModel)}\``,
         `Effort   : \`${resolveEffort(s.effort)}\``,
       ].join('\n'),
       ephemeral: true,
@@ -409,124 +365,46 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // 即応答（Deferred — リサーチに時間がかかるため）
   await interaction.deferReply();
 
+  const statusLines = [`> 🔬 **[Research]** \`${query}\` — ${modelDisplay}`];
+
   try {
-    const statusLines = [`> 🔬 **[Research]** \`${query}\` — ${modelDisplay}`];
+    await interaction.editReply(renderStatus(statusLines));
 
-    // Step 1: 会話履歴を取得（complexと同じ）
-    statusLines.push('> 💬 **[History]** 会話履歴を取得中...');
-    await interaction.editReply(formatStatus(statusLines));
+    const history = await buildConversationHistory(interaction.channel, null, client.user.id);
+    const authorName = interaction.member?.displayName ?? interaction.user.username;
+    const seed = [
+      ...history,
+      { role: 'user', content: `${authorName}: [リサーチ依頼] ${query}` },
+    ];
 
-    const history = await buildConversationHistory(
-      interaction.channel,
-      null,
-      client.user.id
-    );
-    statusLines[statusLines.length - 1] = `> 💬 **[History]** 直近 ${history.length} 件の会話を参照`;
-
-    // Step 2: 全チャンネルからユーザーの発言を収集
-    statusLines.push('> 🔍 **[Scan]** 全チャンネルからユーザー発言を収集中...');
-    await interaction.editReply(formatStatus(statusLines));
-
-    const allTextChannels = interaction.guild.channels.cache.filter(
-      (c) => c.type === ChannelType.GuildText
-    );
-    const userMessages = [];
-    const hitChannels = [];
-    for (const channel of allTextChannels.values()) {
-      try {
-        let fetched = await channel.messages.fetch({ limit: 100 });
-        let channelCount = 0;
-        let batch = 1;
-        const MAX_BATCHES = 30; // 最大3000件/チャンネル
-        while (batch <= MAX_BATCHES && fetched.size > 0) {
-          const userMsgs = [...fetched.values()]
-            .filter((m) => m.author.id === interaction.user.id && m.content.trim());
-          for (const m of userMsgs) {
-            userMessages.push({ channel: channel.name, content: m.content });
-          }
-          channelCount += userMsgs.length;
-          if (userMsgs.length === 0) {
-            // すでに発言が見つかっている → これより古い発言はない。打ち切り
-            if (channelCount > 0) break;
-            // 発言なしチャンネルも5回（500件）までは遡る
-            if (batch >= 5) break;
-          }
-          const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-          const before = sorted[0]?.id;
-          if (!before) break;
-          fetched = await channel.messages.fetch({ limit: 100, before });
-          batch++;
-        }
-        if (channelCount > 0) {
-          hitChannels.push(`#${channel.name}(${channelCount})`);
-        }
-      } catch { /* skip channels we can't read */ }
-    }
-    console.log(`[research:scan] user=${interaction.user.username}(${interaction.user.id}) channels=${allTextChannels.size} hit=${hitChannels.join(', ')} total=${userMessages.length}`);
-    statusLines[statusLines.length - 1] = `> 🔍 **[Scan]** ${userMessages.length}件のユーザー発言を収集（${allTextChannels.size}チャンネル中 ${hitChannels.length}chに発言あり）`;
-
-    // Step 3: ユーザー背景を抽出
-    statusLines.push('> 👤 **[Profile]** ユーザー背景を分析中...');
-    await interaction.editReply(formatStatus(statusLines));
-
-    const userProfile = await extractUserContext(userMessages, settings);
-    if (userProfile) {
-      const preview = userProfile.length > 150 ? userProfile.slice(0, 150) + '...' : userProfile;
-      statusLines[statusLines.length - 1] = `> 👤 **[Profile]** ${preview}`;
-    } else {
-      statusLines[statusLines.length - 1] = '> 👤 **[Profile]** 情報なし';
-    }
-    await interaction.editReply(formatStatus(statusLines));
-
-    // Step 4: 調査計画を立案（ユーザー背景を踏まえて）
-    const nowJST = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short', hour: '2-digit', minute: '2-digit' });
-    let contextText = `【現在日時（日本時間）: ${nowJST}】\n\n${userProfile || ''}`;
-    statusLines.push('> 📋 **[Plan]** Web検索の調査計画を立案中...');
-    await interaction.editReply(formatStatus(statusLines));
-
-    const researchPlan = await planResearch(query, contextText, settings);
-    let planSummary = '';
-    if (researchPlan.subQuestions) {
-      planSummary = [
-        `サブ質問${researchPlan.subQuestions.length}件`,
-        `検索ワード${researchPlan.searchQueries?.length ?? 0}件`,
-        `観点${researchPlan.angles?.length ?? 0}件`,
-      ].join(', ');
-      contextText += `\n\n## 調査計画\n### サブ質問\n${researchPlan.subQuestions.map((q, i) => `${i + 1}. ${q}`).join('\n')}`;
-      contextText += `\n### 検索キーワード\n${researchPlan.searchQueries?.join(', ') ?? ''}`;
-      contextText += `\n### 調査の観点\n${researchPlan.angles?.map((a) => `- ${a}`).join('\n') ?? ''}`;
-    } else if (researchPlan.rawPlan) {
-      planSummary = '計画生成（非構造化）';
-      contextText += `\n\n## 調査計画\n${researchPlan.rawPlan}`;
-    }
-    statusLines[statusLines.length - 1] = `> 📋 **[Plan]** ${planSummary || '計画なし'}`;
-    await interaction.editReply(formatStatus(statusLines));
-
-    // Step 5: リサーチループ → レポート生成
-    const onStatus = async (label) => {
-      statusLines.push(`> ${label}`);
-      await interaction.editReply(formatStatus([...statusLines, '> ⏳ 処理中...']));
-    };
-
-    const report = await runResearch(query, contextText, settings, onStatus);
+    const report = await runAgent({
+      settings,
+      guild: interaction.guild,
+      member: interaction.member,
+      aiChannelIds,
+      seed,
+      mode: 'research',
+      maxIterations: 25,
+      onToolCall: async (label) => {
+        statusLines.push(`> 🔧 ${label}`);
+        await interaction.editReply(renderStatus(statusLines));
+      },
+    });
 
     statusLines.push('> ✅ **[Research]** 完了');
-    await interaction.editReply(formatStatus(statusLines));
+    await interaction.editReply(renderStatus(statusLines));
 
     // レポートを分割送信
-    const chunks = (report ?? 'レポート生成に失敗しました。').match(/.{1,2000}/gs) ?? [];
+    const chunks = chunkMessage(report);
+    if (chunks.length === 0) chunks.push('レポート生成に失敗しました。');
     await interaction.followUp({ content: chunks[0] });
     for (let i = 1; i < chunks.length; i++) {
       await interaction.channel.send(chunks[i]);
     }
-
   } catch (e) {
     console.error('Research error:', e.message, '\n', e.stack);
-    const errorLines = [
-      `> 🔬 **[Research]** \`${query}\``,
-      `> ❌ **[Error]** ${e.message}`,
-    ];
-    await interaction.editReply(formatStatus(errorLines)).catch(() => {});
+    statusLines.push(`> ❌ **[Error]** ${e.message}`);
+    await interaction.editReply(renderStatus(statusLines)).catch(() => {});
   }
 });
 
@@ -540,153 +418,50 @@ client.on(Events.MessageCreate, async (message) => {
   const settings = getGuildSettings(message.guild.id);
   const modelDisplay = `${settings.provider}/${resolveModel(settings.provider, settings.model)}`;
 
-  const statusMsg = await message.reply('> ⏳ **[Router]** 判定中...');
+  const statusMsg = await message.reply('> ⏳ 考え中...');
   const statusLines = [];
 
-  const now = message.createdAt.toLocaleString('ja-JP', {
-    timeZone: 'Asia/Tokyo',
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', weekday: 'short',
-  });
-  const timeContext = `現在時刻: ${now} (JST)`;
-
   try {
-    // ── Step 1: ルーティング判定 ──────────────────────────
-    const serverInfo = buildServerInfo(message.guild);
-    const { type, reason } = await classify(message.content, serverInfo, {
-      routerProvider: settings.routerProvider,
-      routerModel: settings.routerModel,
-    });
-    statusLines.push(`> 🔍 **[Router]** \`${type}\` — ${reason}`);
-    await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[History]** 会話履歴を取得中...']));
-
-    // ── Step 2: 会話履歴取得 ──────────────────────────────
     const history = await buildConversationHistory(
       message.channel,
       message.id,
       client.user.id
     );
-    statusLines.push(`> 💬 **[History]** 直近 ${history.length} 件の会話を参照`);
-    await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[Pipeline]** 次のステップへ...']));
 
-    let response;
+    const authorName = message.member?.displayName ?? message.author.username;
+    const seed = [
+      ...history,
+      {
+        role: 'user',
+        content: `${authorName}: ${message.content}`,
+        ...(userImages.length ? { images: userImages } : {}),
+      },
+    ];
 
-    if (type === 'complex') {
-      const textChannels = message.guild.channels.cache.filter(
-        (c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
-      );
-      const channelList = textChannels
-        .map((c) => `#${c.name} [ID:${c.id}]${c.topic ? ` (${c.topic})` : ''}`)
-        .join('\n');
+    const answer = await runAgent({
+      settings,
+      guild: message.guild,
+      member: message.member,
+      aiChannelIds,
+      seed,
+      onToolCall: async (label) => {
+        statusLines.push(`> 🔧 ${label}`);
+        await statusMsg.edit(renderStatus(statusLines));
+      },
+    });
 
-      // ── Step 3: Plan ──────────────────────────────────────
-      statusLines.push('> 🗺️ **[Plan]** 調査計画を立案中...');
-      await statusMsg.edit(formatStatus(statusLines));
-
-      const plan = await planSearch(message.content, channelList, history, settings);
-      const planLabel = [
-        plan.channels.length > 0 ? plan.channels.map((c) => `#${c}`).join(', ') : null,
-        plan.approach || null,
-      ].filter(Boolean).join(' — ') || 'AIに委任';
-      statusLines[statusLines.length - 1] = `> 🗺️ **[Plan]** ${planLabel}`;
-
-      const systemPrompt = plan.channels.length > 0
-        ? buildSystemWithTools(channelList) +
-          `\n\n## 調査計画\nまず以下のチャンネルから読み始めてください:\n${plan.channels.map((c) => `- #${c}`).join('\n')}` +
-          (plan.approach ? `\n方針: ${plan.approach}` : '')
-        : buildSystemWithTools(channelList);
-
-      // ── Step 4: Tool calls ────────────────────────────────
-      statusLines.push(`> ✍️ **[AI]** 調査中... \`${modelDisplay}\``);
-      await statusMsg.edit(formatStatus(statusLines));
-
-      const msgs = [
-        { role: 'system', content: `${timeContext}\n\n${systemPrompt}` },
-        ...history,
-        { role: 'user', content: message.content, ...(userImages.length ? { images: userImages } : {}) },
-      ];
-
-      const onToolCall = async (label) => {
-        statusLines.push(`> 🔧 **[Tool]** ${label}`);
-        await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[AI]** 処理中...']));
-      };
-
-      let { answer, msgs: contextMsgs } = await chatWithTools(msgs, {
-        guild: message.guild,
-        aiChannelIds,
-        onToolCall,
-        settings,
-        member: message.member,
-      });
-
-      // ── Step 5: Finalize ──────────────────────────────────
-      response = answer;
-      const MAX_RETRIES = 2;
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        statusLines.push('> ✨ **[Finalize]** 整形中...');
-        await statusMsg.edit(formatStatus(statusLines));
-
-        const { ok, answer: finalAnswer, feedback } = await finalizeResponse(
-          message.content, response, history, settings
-        );
-
-        if (ok) {
-          response = finalAnswer;
-          statusLines[statusLines.length - 1] = '> ✨ **[Finalize]** 完了';
-          break;
-        }
-
-        const shortFeedback = feedback.replace(/\\n/g, ' ').replace(/\n/g, ' ').slice(0, 80);
-        statusLines[statusLines.length - 1] = `> 🔄 **[Retry ${attempt + 1}]** ${shortFeedback}`;
-        await statusMsg.edit(formatStatus(statusLines));
-
-        if (attempt === MAX_RETRIES) {
-          statusLines.push('> ⚠️ **[Finalize]** リトライ上限到達');
-          break;
-        }
-
-        contextMsgs.push({ role: 'assistant', content: response });
-        contextMsgs.push({ role: 'system', content: `[内部指示] ${feedback}` });
-        const { answer: retryAnswer } = await chatWithTools(contextMsgs, {
-          guild: message.guild,
-          aiChannelIds,
-          onToolCall: async (label) => {
-            statusLines.push(`> 🔧 **[Tool]** ${label}`);
-            await statusMsg.edit(formatStatus([...statusLines, '> ⏳ **[AI]** 処理中...']));
-          },
-          settings,
-          member: message.member,
-        });
-        response = retryAnswer;
-      }
-    } else {
-      // ── Simple path ───────────────────────────────────────
-      statusLines.push(`> ✍️ **[AI]** 生成中... \`${modelDisplay}\``);
-      await statusMsg.edit(formatStatus(statusLines));
-
-      const msgs = [
-        { role: 'system', content: `${timeContext}\n\n${SYSTEM_SIMPLE}` },
-        ...history,
-        { role: 'user', content: message.content, ...(userImages.length ? { images: userImages } : {}) },
-      ];
-      response = await chatSimple(msgs, settings);
-    }
-
-    // ── 送信 ─────────────────────────────────────────────
-    const chunks = (response ?? '').match(/.{1,2000}/gsu) ?? [];
-    for (const chunk of chunks) {
+    for (const chunk of chunkMessage(answer)) {
       await message.channel.send(chunk);
     }
 
-    if (type !== 'complex') {
-      statusLines[statusLines.length - 1] = `> ✅ **[AI]** 生成完了 \`${modelDisplay}\``;
-    }
-    await statusMsg.edit(formatStatus(statusLines));
-
+    const finalLines = statusLines.length
+      ? [...statusLines, `> ✅ 完了 (${modelDisplay})`]
+      : [`> ✅ (${modelDisplay})`];
+    await statusMsg.edit(renderStatus(finalLines));
   } catch (e) {
     console.error('Error:', e.message);
     statusLines.push(`> ❌ **[Error]** ${e.message}`);
-    await statusMsg.edit(formatStatus(statusLines));
+    await statusMsg.edit(renderStatus(statusLines)).catch(() => {});
   }
 });
 
