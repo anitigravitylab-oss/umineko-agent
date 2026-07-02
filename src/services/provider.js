@@ -38,46 +38,6 @@ function toGeminiTools(tools) {
   }];
 }
 
-function findToolName(messages, toolCallId) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const tc = messages[i].tool_calls?.find((t) => t.id === toolCallId);
-    if (tc) return tc.function.name;
-  }
-  return 'unknown';
-}
-
-function toGeminiContents(messages) {
-  const contents = [];
-  for (const msg of messages) {
-    if (msg.role === 'system') continue;
-    if (msg.role === 'user') {
-      contents.push({ role: 'user', parts: [{ text: msg.content ?? '' }] });
-    } else if (msg.role === 'assistant') {
-      if (msg.tool_calls?.length) {
-        const parts = [];
-        if (msg.content) parts.push({ text: msg.content });
-        for (const tc of msg.tool_calls) {
-          const part = {
-            functionCall: { name: tc.function.name, args: JSON.parse(tc.function.arguments) },
-          };
-          if (tc._thoughtSignature) part.thoughtSignature = tc._thoughtSignature;
-          parts.push(part);
-        }
-        contents.push({ role: 'model', parts });
-      } else {
-        contents.push({ role: 'model', parts: [{ text: msg.content ?? '' }] });
-      }
-    } else if (msg.role === 'tool') {
-      const name = findToolName(messages, msg.tool_call_id);
-      contents.push({
-        role: 'user',
-        parts: [{ functionResponse: { name, response: { output: String(msg.content ?? '') } } }],
-      });
-    }
-  }
-  return contents;
-}
-
 function isGeminiRetryable(e) {
   return e.status === 503 || e.status === 429 ||
     (typeof e.message === 'string' && (e.message.includes('UNAVAILABLE') || e.message.includes('overloaded')));
@@ -104,19 +64,6 @@ function getClaudeToken() {
 
 function isClaudeRetryable(status) {
   return status === 429 || status === 500 || status === 503 || status === 529;
-}
-
-// Build the Anthropic `system` param: Claude Code identity first, then the
-// app's own system prompt(s) joined together.
-function buildClaudeSystem(messages) {
-  const sys = messages
-    .filter((ms) => ms.role === 'system')
-    .map((ms) => ms.content)
-    .filter(Boolean)
-    .join('\n\n');
-  const blocks = [{ type: 'text', text: CLAUDE_CODE_IDENTITY }];
-  if (sys) blocks.push({ type: 'text', text: sys });
-  return blocks;
 }
 
 function toClaudeTools(tools) {
@@ -156,10 +103,9 @@ async function fetchImageAsBase64(url) {
   }
 }
 
-// Convert OpenAI-format messages → Anthropic messages.
-// - system messages are handled separately (buildClaudeSystem)
-// - assistant tool_calls → tool_use content blocks
-// - tool results → user message with tool_result blocks
+// Convert seed messages (OpenAI-style {role, content, images?}) → Anthropic messages.
+// Used once when a Claude session starts; after that the session appends
+// native Anthropic blocks directly.
 async function toClaudeMessages(messages) {
   const raw = [];
   for (const msg of messages) {
@@ -180,20 +126,10 @@ async function toClaudeMessages(messages) {
       if (msg.content && msg.content.toString().trim()) {
         blocks.push({ type: 'text', text: msg.content.toString() });
       }
-      if (msg.tool_calls?.length) {
-        for (const tc of msg.tool_calls) {
-          let input = {};
-          try { input = JSON.parse(tc.function.arguments || '{}'); } catch { input = {}; }
-          blocks.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
-        }
-      }
       if (blocks.length) raw.push({ role: 'assistant', content: blocks });
-    } else if (msg.role === 'tool') {
-      const content = (msg.content ?? '').toString() || '(empty)';
-      raw.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: msg.tool_call_id, content }] });
     }
   }
-  // Merge adjacent same-role messages (tool_result blocks must share one user turn).
+  // Merge adjacent same-role messages into one turn.
   const merged = [];
   for (const m of raw) {
     const last = merged[merged.length - 1];
@@ -204,10 +140,7 @@ async function toClaudeMessages(messages) {
   while (merged.length && merged[0].role === 'assistant') merged.shift();
   if (merged.length === 0) merged.push({ role: 'user', content: [{ type: 'text', text: '(no content)' }] });
   // Anthropic rejects a conversation ending on 'assistant' (no prefill support).
-  // This happens when a trailing system-role message (e.g. an internal retry
-  // instruction) gets filtered out above, leaving the prior assistant turn last.
-  // The instruction still reaches Claude via buildClaudeSystem — this just
-  // anchors the conversation back onto a valid trailing user turn.
+  // Anchor the conversation back onto a valid trailing user turn.
   if (merged[merged.length - 1].role === 'assistant') {
     merged.push({ role: 'user', content: [{ type: 'text', text: '続けてください。' }] });
   }
@@ -274,152 +207,153 @@ function resolveClaudeEffort(effort, model) {
   return (effort || DEFAULT_CLAUDE_EFFORT).toLowerCase();
 }
 
-async function claudeCallText(messages, { maxTokens, model, effort }) {
-  const resolvedEffort = resolveClaudeEffort(effort, model);
-  const data = await claudeFetch({
-    model,
-    max_tokens: maxTokens,
-    system: buildClaudeSystem(messages),
-    messages: await toClaudeMessages(messages),
-    ...(resolvedEffort ? { output_config: { effort: resolvedEffort } } : {}),
-  });
-  const text = (data.content ?? [])
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text)
-    .join('');
-  if (!text || !text.trim()) {
-    console.warn(`[provider] Claude callText returned empty (model=${model}, stop=${data.stop_reason})`);
-  }
-  return text;
-}
+// ── ClaudeAgentSession ─────────────────────────────────────────────────
+// Anthropicネイティブのmessages配列を会話状態として所有するセッション。
+// - レスポンスのcontentブロック配列は一切加工せずそのまま保存する
+//   （thinking / text / tool_use、signature含めて完全保存 → 次リクエストで
+//   そのまま返送。Anthropicは同一モデルへのthinkingブロック返送を推奨）
+// - ツール結果画像は tool_result.content 内へネイティブ埋め込み
+// - プロンプトキャッシュ: persona境界 + messages末尾ブロックに cache_control
+const MAX_TOOL_RESULT_IMAGES = 4; // 1ラウンドあたりの上限（現行踏襲）
 
-async function claudeCallWithTools(messages, tools, { model, effort }) {
-  const resolvedEffort = resolveClaudeEffort(effort, model);
-  const data = await claudeFetch({
-    model,
-    // Fable 5 / Sonnet 5 spend part of this budget on always-on/adaptive
-    // thinking before writing any visible text — confirmed live that a
-    // demanding prompt can burn the entire 4096 on thinking alone, leaving
-    // an empty or truncated answer (stop_reason: max_tokens). 16000 leaves
-    // real headroom for both.
-    max_tokens: 16000,
-    system: buildClaudeSystem(messages),
-    tools: toClaudeTools(tools),
-    messages: await toClaudeMessages(messages),
-    ...(resolvedEffort ? { output_config: { effort: resolvedEffort } } : {}),
-  });
-  const blocks = data.content ?? [];
-  const toolUse = blocks.filter((b) => b.type === 'tool_use');
-  const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('');
-  if (toolUse.length === 0 && (!text || !text.trim())) {
-    console.warn(`[provider] Claude callWithTools returned empty (model=${model}, stop=${data.stop_reason})`);
+class ClaudeAgentSession {
+  constructor({ model, effort, system, tools, seed }) {
+    this.model = model;
+    this.effort = effort;
+    this.system = system;
+    this.tools = tools;
+    this.messages = null;
+    // seedの変換（画像のbase64化を含む）は非同期なので、開始時に1回だけ
+    // 走らせて全公開メソッドで完了を待つ。
+    this._ready = toClaudeMessages(seed).then((msgs) => { this.messages = msgs; });
   }
 
-  if (toolUse.length > 0) {
-    const toolCalls = toolUse.map((b) => ({ id: b.id, name: b.name, arguments: b.input ?? {} }));
-    const rawMessage = {
-      role: 'assistant',
-      content: text || null,
-      tool_calls: toolUse.map((b) => ({
-        id: b.id,
-        type: 'function',
-        function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
-      })),
-    };
-    return { content: text || null, toolCalls, rawMessage };
-  }
-  return { content: text, toolCalls: null, rawMessage: null };
-}
-
-// ── callText: simple text completion, returns string ───────────────────
-// provider/model are optional — fall back to env vars if omitted
-// Default raised 4096→16000: chatWithTools' followUp/final-answer calls rely
-// on this default, and Fable 5 / Sonnet 5's always-on/adaptive thinking can
-// burn 4096 entirely before writing any visible text (same bug fixed in
-// claudeCallWithTools; confirmed live in production logs on this exact path).
-export async function callText(messages, { maxTokens = 16000, provider, model, effort } = {}) {
-  const { p, m } = resolveProviderModel(provider, model);
-  // Collect ALL system messages (not just the first one)
-  const systemMsgs = messages.filter((ms) => ms.role === 'system');
-  const systemInstruction = systemMsgs.map((ms) => ms.content).join('\n\n') || undefined;
-
-  if (p === 'claude') {
-    return claudeCallText(messages, { maxTokens, model: m, effort });
+  // 隣接する同role発言は1ターンにまとめる（旧toClaudeMessagesのマージ挙動を維持）
+  _push(role, blocks) {
+    if (!blocks.length) return;
+    const last = this.messages[this.messages.length - 1];
+    if (last && last.role === role) last.content.push(...blocks);
+    else this.messages.push({ role, content: blocks });
   }
 
-  if (p === 'gemini') {
-    const MAX_GEMINI_RETRIES = 3;
-    let lastErr;
-    for (let attempt = 1; attempt <= MAX_GEMINI_RETRIES; attempt++) {
-      try {
-        const response = await getGemini().models.generateContent({
-          model: m,
-          contents: toGeminiContents(messages),
-          config: { systemInstruction, maxOutputTokens: maxTokens },
-        });
-        return response.text ?? '';
-      } catch (e) {
-        if (isGeminiRetryable(e) && attempt < MAX_GEMINI_RETRIES) {
-          console.warn(`[provider] Gemini callText 503/429 attempt ${attempt}, retrying in ${attempt * 5}s...`);
-          await new Promise((r) => setTimeout(r, attempt * 5000));
-          lastErr = e;
-          continue;
-        }
-        throw e;
-      }
+  // リクエスト組み立て時のみ、messages末尾のブロックに cache_control を付与。
+  // 内部状態は汚さない（シャローコピー）。反復ごとに前反復までのプレフィックス
+  // がcache hitする。thinkingブロックにはcache_controlを付けられないので回避。
+  _requestMessages() {
+    return this.messages.map((m, i) => {
+      if (i !== this.messages.length - 1 || !Array.isArray(m.content) || m.content.length === 0) return m;
+      const content = m.content.map((b, j) => {
+        if (j !== m.content.length - 1) return b;
+        if (b.type === 'thinking' || b.type === 'redacted_thinking') return b;
+        return { ...b, cache_control: { type: 'ephemeral' } };
+      });
+      return { ...m, content };
+    });
+  }
+
+  async step({ noTools = false } = {}) {
+    await this._ready;
+    const resolvedEffort = resolveClaudeEffort(this.effort, this.model);
+    const data = await claudeFetch({
+      model: this.model,
+      // Fable 5 / Sonnet 5 spend part of this budget on always-on/adaptive
+      // thinking before writing any visible text — 16000 leaves real headroom.
+      max_tokens: 16000,
+      // system: identity → persona（キャッシュ境界）→ 時刻（可変部は境界の後ろ）
+      system: [
+        { type: 'text', text: CLAUDE_CODE_IDENTITY },
+        { type: 'text', text: this.system.persona, cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: this.system.time },
+      ],
+      ...(noTools ? {} : { tools: toClaudeTools(this.tools) }),
+      messages: this._requestMessages(),
+      ...(resolvedEffort ? { output_config: { effort: resolvedEffort } } : {}),
+    });
+    const blocks = data.content ?? [];
+    // レスポンスブロックを無加工でassistantターンとして保存
+    if (blocks.length) this.messages.push({ role: 'assistant', content: blocks });
+    const u = data.usage ?? {};
+    console.log(`[usage] model=${data.model ?? this.model} in=${u.input_tokens ?? 0} cache_read=${u.cache_read_input_tokens ?? 0} cache_write=${u.cache_creation_input_tokens ?? 0} out=${u.output_tokens ?? 0}`);
+    const toolUse = blocks.filter((b) => b.type === 'tool_use');
+    const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('');
+    if (toolUse.length === 0 && (!text || !text.trim())) {
+      console.warn(`[provider] Claude step returned empty (model=${this.model}, stop=${data.stop_reason})`);
     }
-    throw lastErr;
+    return {
+      text,
+      toolCalls: toolUse.length > 0
+        ? toolUse.map((b) => ({ id: b.id, name: b.name, arguments: b.input ?? {} }))
+        : null,
+    };
   }
 
-  const tokenParam = p === 'openai' ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens };
-  const completion = await getOpenAIClient(p).chat.completions.create({
-    model: m,
-    messages: messages.map(({ images, ...rest }) => rest),
-    ...tokenParam,
-  });
-  const content = completion.choices?.[0]?.message?.content ?? '';
-  if (!content || !content.trim()) {
-    console.warn(`[provider] callText returned empty/null content (model=${m}, finish=${completion.choices?.[0]?.finish_reason})`);
+  // ツール結果は1つのuserターンにまとめ、各tool_resultのcontent配列に
+  // textブロック + 画像のimageブロックをネイティブ埋め込みする。
+  async addToolResults(results) {
+    await this._ready;
+    let imageBudget = MAX_TOOL_RESULT_IMAGES;
+    const blocks = [];
+    for (const r of results) {
+      const content = [{ type: 'text', text: (r.text ?? '').toString() || '(empty)' }];
+      const urls = (r.images ?? []).slice(0, Math.max(0, imageBudget));
+      imageBudget -= urls.length;
+      if (urls.length) {
+        const fetched = await Promise.all(urls.map(fetchImageAsBase64));
+        for (const img of fetched) {
+          if (img) content.push({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } });
+        }
+      }
+      blocks.push({ type: 'tool_result', tool_use_id: r.id, content });
+    }
+    this._push('user', blocks);
   }
-  return content;
+
+  async addUserText(text) {
+    await this._ready;
+    this._push('user', [{ type: 'text', text }]);
+  }
 }
 
-// ── callWithTools: tool-use completion ────────────────────────────────
-// Returns { content, toolCalls, rawMessage }
-// toolCalls: [{id, name, arguments: object}] | null
-// rawMessage: OpenAI-format assistant message to push into msgs
-export async function callWithTools(messages, tools, { provider, model, effort } = {}) {
-  const { p, m } = resolveProviderModel(provider, model);
-
-  if (p === 'claude') {
-    return claudeCallWithTools(messages, tools, { model: m, effort });
+// ── GeminiAgentSession ─────────────────────────────────────────────────
+// Geminiネイティブのcontents配列を所有。functionCallパーツ
+// （thoughtSignature含む）はネイティブのまま追記する。画像は無視（現状踏襲）。
+class GeminiAgentSession {
+  constructor({ model, system, tools, seed }) {
+    this.model = model;
+    this.systemInstruction = `${system.persona}\n\n${system.time}`;
+    this.tools = tools;
+    this._toolNamesById = new Map();
+    this.contents = seed
+      .filter((msg) => msg.role === 'user' || msg.role === 'assistant')
+      .map((msg) => ({
+        role: msg.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: (msg.content ?? '').toString() }],
+      }));
   }
 
-  if (p === 'gemini') {
-    const systemInstruction = messages
-      .filter((ms) => ms.role === 'system')
-      .map((ms) => ms.content)
-      .join('\n\n') || undefined;
+  async step({ noTools = false } = {}) {
     const MAX_GEMINI_RETRIES = 3;
     let lastErr;
     let response;
     for (let attempt = 1; attempt <= MAX_GEMINI_RETRIES; attempt++) {
       try {
         response = await getGemini().models.generateContent({
-          model: m,
-          contents: toGeminiContents(messages),
-          config: {
-            systemInstruction,
-            tools: toGeminiTools(tools),
-            maxOutputTokens: 4096,
-            thinkingConfig: { thinkingBudget: 0 },
-          },
+          model: this.model,
+          contents: this.contents,
+          config: noTools
+            ? { systemInstruction: this.systemInstruction, maxOutputTokens: 16000 }
+            : {
+                systemInstruction: this.systemInstruction,
+                tools: toGeminiTools(this.tools),
+                maxOutputTokens: 4096,
+                thinkingConfig: { thinkingBudget: 0 },
+              },
         });
         break;
       } catch (e) {
         if (isGeminiRetryable(e) && attempt < MAX_GEMINI_RETRIES) {
-          console.warn(`[provider] Gemini callWithTools 503/429 attempt ${attempt}, retrying in ${attempt * 5}s...`);
-          await new Promise((r) => setTimeout(r, attempt * 5000));
+          console.warn(`[provider] Gemini 503/429 attempt ${attempt}, retrying in ${attempt * 5}s...`);
+          await sleep(attempt * 5000);
           lastErr = e;
           continue;
         }
@@ -428,67 +362,120 @@ export async function callWithTools(messages, tools, { provider, model, effort }
     }
     if (!response) throw lastErr;
 
-    const respParts = response.candidates?.[0]?.content?.parts ?? [];
-    const fnParts = respParts.filter((p) => p.functionCall);
+    const parts = response.candidates?.[0]?.content?.parts ?? [];
+    const fnParts = parts.filter((pt) => pt.functionCall);
     if (fnParts.length > 0) {
-      const toolCalls = fnParts.map((p) => ({
-        id: makeCallId(),
-        name: p.functionCall.name,
-        arguments: p.functionCall.args,
-        _thoughtSignature: p.thoughtSignature,
-      }));
-      const rawMessage = {
-        role: 'assistant',
-        content: null,
-        tool_calls: toolCalls.map((tc) => ({
-          id: tc.id,
-          type: 'function',
-          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
-          _thoughtSignature: tc._thoughtSignature,
-        })),
-      };
-      return { content: null, toolCalls, rawMessage };
-    }
-
-    return { content: response.text ?? '', toolCalls: null, rawMessage: null };
-  }
-
-  // DeepSeek / OpenAI — with retry for 503
-  const MAX_RETRIES = 3;
-  let lastError;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    let completion;
-    try {
-      const tokenParam = p === 'openai' ? { max_completion_tokens: 4096 } : { max_tokens: 4096 };
-      completion = await getOpenAIClient(p).chat.completions.create({
-        model: m,
-        messages: messages.map(({ images, ...rest }) => rest),
-        tools,
-        ...tokenParam,
+      this.contents.push({ role: 'model', parts }); // ネイティブのまま保存
+      const toolCalls = fnParts.map((pt) => {
+        const id = makeCallId();
+        this._toolNamesById.set(id, pt.functionCall.name);
+        return { id, name: pt.functionCall.name, arguments: pt.functionCall.args ?? {} };
       });
-    } catch (e) {
-      if (e.status === 503 && attempt < MAX_RETRIES) {
-        console.warn(`[provider] 503 attempt ${attempt}, retrying in ${attempt * 5}s...`);
-        await new Promise((r) => setTimeout(r, attempt * 5000));
-        lastError = e;
-        continue;
-      }
-      throw e;
+      return { text: '', toolCalls };
     }
-
-    const choice = completion.choices[0];
-    if (choice.finish_reason === 'tool_calls') {
-      return {
-        content: null,
-        toolCalls: choice.message.tool_calls.map((tc) => ({
-          id: tc.id,
-          name: tc.function.name,
-          arguments: JSON.parse(tc.function.arguments),
-        })),
-        rawMessage: choice.message,
-      };
-    }
-    return { content: choice.message.content ?? '', toolCalls: null, rawMessage: null };
+    const text = response.text ?? '';
+    if (parts.length > 0) this.contents.push({ role: 'model', parts });
+    return { text, toolCalls: null };
   }
-  throw lastError ?? new Error('callWithTools failed after retries');
+
+  addToolResults(results) {
+    const parts = results.map((r) => ({
+      functionResponse: {
+        name: this._toolNamesById.get(r.id) ?? 'unknown',
+        response: { output: String(r.text ?? '') },
+      },
+    }));
+    for (const r of results) this._toolNamesById.delete(r.id);
+    this.contents.push({ role: 'user', parts });
+  }
+
+  addUserText(text) {
+    this.contents.push({ role: 'user', parts: [{ text }] });
+  }
+}
+
+// ── OpenAICompatSession（openai / deepseek 共用） ──────────────────────
+// OpenAI形式messagesを所有。imagesフィールドは送信時に除去（現状踏襲）。
+class OpenAICompatSession {
+  constructor({ provider, model, system, tools, seed }) {
+    this.provider = provider;
+    this.model = model;
+    this.tools = tools;
+    this.messages = [
+      { role: 'system', content: `${system.persona}\n\n${system.time}` },
+      ...seed.map((m) => ({ ...m })),
+    ];
+  }
+
+  async step({ noTools = false } = {}) {
+    const MAX_RETRIES = 3;
+    let lastError;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      let completion;
+      try {
+        const maxTokens = noTools ? 16000 : 4096;
+        const tokenParam = this.provider === 'openai'
+          ? { max_completion_tokens: maxTokens }
+          : { max_tokens: maxTokens };
+        completion = await getOpenAIClient(this.provider).chat.completions.create({
+          model: this.model,
+          messages: this.messages.map(({ images, ...rest }) => rest),
+          ...(noTools ? {} : { tools: this.tools }),
+          ...tokenParam,
+        });
+      } catch (e) {
+        if (e.status === 503 && attempt < MAX_RETRIES) {
+          console.warn(`[provider] ${this.provider} 503 attempt ${attempt}, retrying in ${attempt * 5}s...`);
+          await sleep(attempt * 5000);
+          lastError = e;
+          continue;
+        }
+        throw e;
+      }
+
+      const choice = completion.choices[0];
+      if (choice.message.tool_calls?.length) {
+        this.messages.push(choice.message);
+        return {
+          text: choice.message.content ?? '',
+          toolCalls: choice.message.tool_calls.map((tc) => ({
+            id: tc.id,
+            name: tc.function.name,
+            arguments: JSON.parse(tc.function.arguments),
+          })),
+        };
+      }
+      const text = choice.message.content ?? '';
+      if (!text.trim()) {
+        console.warn(`[provider] ${this.provider} step returned empty (model=${this.model}, finish=${choice.finish_reason})`);
+      }
+      this.messages.push({ role: 'assistant', content: text });
+      return { text, toolCalls: null };
+    }
+    throw lastError ?? new Error('step failed after retries');
+  }
+
+  addToolResults(results) {
+    for (const r of results) {
+      this.messages.push({ role: 'tool', tool_call_id: r.id, content: (r.text ?? '').toString() || '(empty)' });
+    }
+  }
+
+  addUserText(text) {
+    this.messages.push({ role: 'user', content: text });
+  }
+}
+
+// ── createAgentSession ─────────────────────────────────────────────────
+// プロバイダー別の会話状態を所有するセッションを作る。
+//   system = { persona, time }（prompt.jsのbuildSystemPrompt出力）
+//   tools  = OpenAI形式のツール定義配列（tools.jsのTOOLS）
+//   seed   = [{ role:'user'|'assistant', content: string, images?: string[] }]
+// session.step({ noTools }) → { text, toolCalls: [{id, name, arguments}]|null }
+// session.addToolResults([{ id, text, images }]) / session.addUserText(text)
+export function createAgentSession({ provider, model, effort, system, tools, seed = [] } = {}) {
+  const { p, m } = resolveProviderModel(provider, model);
+  if (p === 'claude') return new ClaudeAgentSession({ model: m, effort, system, tools, seed });
+  if (p === 'gemini') return new GeminiAgentSession({ model: m, system, tools, seed });
+  return new OpenAICompatSession({ provider: p, model: m, system, tools, seed });
 }

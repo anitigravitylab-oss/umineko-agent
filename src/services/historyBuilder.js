@@ -18,9 +18,11 @@ export async function buildConversationHistory(channel, currentMessageId, botUse
     .slice(-HISTORY_LIMIT)
     .map((m) => {
       const images = extractImageUrls(m);
+      const isBot = m.author.id === botUserId;
       return {
-        role: m.author.id === botUserId ? 'assistant' : 'user',
-        content: m.content,
+        role: isBot ? 'assistant' : 'user',
+        // user発言には発言者名を付与（bot自身の発言は素のまま）
+        content: isBot ? m.content : `${m.member?.displayName ?? m.author.username}: ${m.content}`,
         ...(images.length ? { images } : {}),
       };
     });
