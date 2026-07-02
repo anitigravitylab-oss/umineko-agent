@@ -4,6 +4,7 @@ import { Client, GatewayIntentBits, Events, ChannelType, REST, Routes } from 'di
 import { runAgent } from './services/agent.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { extractImageUrls } from './services/attachments.js';
+import { createStreamReply } from './services/streamReply.js';
 import {
   getGuildSettings,
   updateGuildSettings,
@@ -134,10 +135,20 @@ function isGuildAllowed(guildId) {
 
 // ── AI_CHANNEL_PREFIX ────────────────────────────────────────────────
 const AI_CHANNEL_PREFIX = process.env.AI_CHANNEL_PREFIX || 'ai-';
+// #ai-memory はbotの長期記憶専用チャンネル特例。"ai-"プレフィックスに
+// マッチしても自動登録せず（＝会話に反応しない）、プロンプト側からの
+// 自主参照・自主書き込み専用にする（prompt.js / tools.js側の対応と対）。
+const AI_MEMORY_CHANNEL_NAME = 'ai-memory';
 const aiChannelIds = new Set();
 
-function isAiChatChannel(channel) {
-  return channel.type === ChannelType.GuildText && channel.name.startsWith(AI_CHANNEL_PREFIX);
+// 純関数（チャンネル名だけを見る）。登録箇所（起動時スキャン・GuildCreate・
+// ChannelCreate）を全てこれに統一し、ユニットテスト可能にする。
+export function isAiChatChannel(name) {
+  return name.startsWith(AI_CHANNEL_PREFIX) && name !== AI_MEMORY_CHANNEL_NAME;
+}
+
+function isAiChannelCandidate(channel) {
+  return channel.type === ChannelType.GuildText && isAiChatChannel(channel.name);
 }
 
 client.once(Events.ClientReady, async (c) => {
@@ -150,7 +161,7 @@ client.once(Events.ClientReady, async (c) => {
       continue;
     }
     for (const [, channel] of guild.channels.cache) {
-      if (isAiChatChannel(channel)) {
+      if (isAiChannelCandidate(channel)) {
         aiChannelIds.add(channel.id);
         console.log(`AI channel registered: #${channel.name} (${channel.id})`);
       }
@@ -163,7 +174,7 @@ client.once(Events.ClientReady, async (c) => {
 client.on(Events.GuildCreate, async (guild) => {
   // Scan AI channels for newly joined guild
   for (const [, channel] of guild.channels.cache) {
-    if (isAiChatChannel(channel)) {
+    if (isAiChannelCandidate(channel)) {
       aiChannelIds.add(channel.id);
       console.log(`AI channel registered: #${channel.name} (${channel.id})`);
     }
@@ -173,7 +184,7 @@ client.on(Events.GuildCreate, async (guild) => {
 });
 
 client.on(Events.ChannelCreate, (channel) => {
-  if (isAiChatChannel(channel)) {
+  if (isAiChannelCandidate(channel)) {
     aiChannelIds.add(channel.id);
     console.log(`AI channel registered: #${channel.name} (${channel.id})`);
   }
@@ -209,6 +220,11 @@ setInterval(() => {
 
 async function ensureDefaultChannel(guild) {
   const defaultName = process.env.AI_CHANNEL_NAME || 'ai-chat';
+  // ai-memory等、AIチャットチャンネルにできない名前は自動作成・登録の対象外
+  if (!isAiChatChannel(defaultName)) {
+    console.warn(`[config] AI_CHANNEL_NAME="${defaultName}" はAIチャットチャンネル名にできないため自動作成しません`);
+    return;
+  }
   const existing = guild.channels.cache.find(
     (ch) => ch.name === defaultName && ch.type === ChannelType.GuildText
   );
@@ -420,6 +436,8 @@ client.on(Events.MessageCreate, async (message) => {
 
   const statusMsg = await message.reply('> ⏳ 考え中...');
   const statusLines = [];
+  const reply = createStreamReply(message.channel);
+  let streamedAny = false;
 
   try {
     const history = await buildConversationHistory(
@@ -444,14 +462,25 @@ client.on(Events.MessageCreate, async (message) => {
       member: message.member,
       aiChannelIds,
       seed,
+      onAnswerDelta: async (text) => {
+        streamedAny = true;
+        await reply.update(text);
+      },
       onToolCall: async (label) => {
+        // このstepはtool_useで終わった＝直前までストリームした本文は最終回答
+        // ではない。作りかけのメッセージを撤退させ、次stepはまっさらから。
+        await reply.reset();
         statusLines.push(`> 🔧 ${label}`);
         await statusMsg.edit(renderStatus(statusLines));
       },
     });
 
-    for (const chunk of chunkMessage(answer)) {
-      await message.channel.send(chunk);
+    if (streamedAny) {
+      await reply.finalize(answer);
+    } else {
+      for (const chunk of chunkMessage(answer)) {
+        await message.channel.send(chunk);
+      }
     }
 
     const finalLines = statusLines.length

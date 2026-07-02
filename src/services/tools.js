@@ -128,6 +128,21 @@ const DISCORD_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'delete_message',
+      description: 'Discordの指定メッセージを削除する。自分（bot）のメッセージのみ削除可能。主に#ai-memoryの記憶更新（古い記憶を消してから書き直す）に使う。',
+      parameters: {
+        type: 'object',
+        properties: {
+          channel_id: { type: 'string', description: '削除するメッセージがあるチャンネルのID' },
+          message_id: { type: 'string', description: '削除するメッセージのID（read_channelで取得）' },
+        },
+        required: ['channel_id', 'message_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'delete_channel',
       description: 'Discordの指定チャンネルを削除する',
       parameters: {
@@ -365,6 +380,22 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
       }
     }
 
+    case 'delete_message': {
+      const channel = guild.channels.cache.get(args.channel_id);
+      if (!channel) return `チャンネルID ${args.channel_id} が見つかりませんでした。`;
+      try {
+        const msg = await channel.messages.fetch(args.message_id);
+        const botId = guild.client?.user?.id ?? guild.members?.me?.id;
+        if (msg.author.id !== botId) {
+          return '権限エラー: 自分のメッセージ以外は削除できません。';
+        }
+        await msg.delete();
+        return `メッセージ ${args.message_id} を削除しました。`;
+      } catch (e) {
+        return `削除失敗: ${e.message}`;
+      }
+    }
+
     case 'delete_channel': {
       const channel = guild.channels.cache.find(
         (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
@@ -466,6 +497,10 @@ export function toolLabel(name, args, result) {
     case 'create_channel': return `\`create_channel("${args.channel_name}")\` → 作成完了`;
     case 'edit_channel': return `\`edit_channel("${args.channel_name}")\` → 更新完了`;
     case 'edit_message': return `\`edit_message("${args.channel_name}", ${args.message_id})\` → 編集完了`;
+    case 'delete_message': {
+      const status = result.startsWith('権限エラー') ? '権限エラー' : (result.startsWith('削除失敗') ? '削除失敗' : '削除完了');
+      return `\`delete_message(${args.channel_id}, ${args.message_id})\` → ${status}`;
+    }
     case 'delete_channel': return `\`delete_channel("${args.channel_name}")\` → 削除完了`;
     case 'create_category': return `\`create_category("${args.category_name}")\` → 作成完了`;
     case 'edit_category': return `\`edit_category("${args.category_name}")\` → "${args.new_name}" に変更`;

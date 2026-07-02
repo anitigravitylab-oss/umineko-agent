@@ -1,204 +1,71 @@
-# タスク: umineko v2 — 単一ループエージェント化（Phase 1本丸）
+# Phase 2: ストリーミング + #ai-memory（自主参照方式）
 
-## 目的
-Router → Planner → Tool Loop → Finalizer の多段パイプラインを廃止し、「1つのsystemプロンプト + 1本のエージェントループ」に置き換える。モデル自身がツール使用・調査計画・品質を判断する。同時に、Claude経路のthinkingブロック保存・プロンプトキャッシュ・履歴の発言者付与を実装する。
+前提: v2単一ループアーキテクチャ（runAgent / createAgentSession / buildSystemPrompt / tools.js）はmainにマージ・本番稼働済み。このタスクはその上に2機能を足す。作業ブランチ: `feat/streaming-ai-memory`（main から分岐済み。コミットは親が行うので不要）。
 
-## 背景（なぜやるか）
-- Router(Gemini)は503障害の単一障害点で、出力はほぼ常に"complex"
-- PlannerはFable5/Sonnet5でthinkingがmaxTokens:300を食い尽くし毎回no-op
-- Finalizerはインフラ障害を品質問題と誤診して高価な全ループ再実行を起こした実績あり
-- 現在の内部形式(OpenAI互換)への毎反復変換で、Claudeのthinkingブロックが毎回捨てられている（Anthropicは同一モデルでのthinkingブロック返送を推奨）
-- プロンプトキャッシュ未使用＋systemプロンプト先頭に毎分変わる時刻（キャッシュバスター）
+## 機能A: Claude系ストリーミング
 
-## 最終的なファイル構成
+### A-1. ClaudeAgentSession.step() のSSE対応（src/services/provider.js）
+- `step({ noTools, onTextDelta } = {})` に拡張。`onTextDelta` が渡されたときだけ `stream: true` でリクエストする（渡されなければ現行の非ストリーミングのまま）。
+- SSEパース: fetchのbody ReadableStreamをTextDecoderで行単位バッファリング（チャンク境界で行が割れるケースを必ず処理）。`event:` / `data:` 行を解釈。`ping`イベントは無視。`error`イベントは例外をthrow（既存のリトライループに乗せる）。
+- コンテンツブロック再組み立て: `content_block_start`/`content_block_delta`/`content_block_stop` から、非ストリーミング時と等価なblocks配列を復元する。
+  - `text_delta` → textブロックに追記。追記のたびに `onTextDelta(累積テキスト全体)` を呼ぶ（差分ではなく累積を渡す）。
+  - `thinking_delta` → thinkingブロックのthinkingフィールドに追記。**`signature_delta` → thinkingブロックのsignatureに格納。これを落とすと次反復のリプレイがAPIに拒否されるので絶対に落とさない。**
+  - `input_json_delta` → tool_useブロックのpartial_jsonを蓄積し、`content_block_stop` で `JSON.parse` して input に格納（空文字列は `{}` 扱い）。
+  - thinkingのテキストは `onTextDelta` に流さない（回答テキストのみ）。
+- `message_delta` から stop_reason と usage を取得し、既存の `[usage]` ログを同形式で出す（cache_read等含む）。
+- 組み立てたblocksは非ストリーミング時と同じく **verbatimで this.messages に保存**（thinking含む）。ここの挙動差ゼロが最重要。
+- リクエスト成功後にのみ this.messages を変更する（ストリーム途中死→リトライで会話状態が壊れない）。
+- claudeFetch のOAuthヘッダー・betas・リトライ回数・Fable5フォールバックは一切変更しない。ストリーミング時のタイムアウトのみ変更: 全体300s固定ではなく「**60秒間データが1バイトも来なければabort**」のアイドルタイムアウト（AbortController + チャンク受信ごとにタイマーリセット）。非ストリーミング経路は現行の `AbortSignal.timeout(300000)` のまま。
 
-```
-src/
-  index.js            … 書き換え（ハンドラー簡素化・/ai router系削除・/research新実装）
-  services/
-    agent.js          … 【新規】ループ駆動
-    prompt.js         … 【新規】systemプロンプト組み立て
-    provider.js       … 【大改修】createAgentSession（プロバイダー別セッション）
-    tools.js          … 【新規】llm.jsからツール定義・executeTool・toolLabel・ADMIN_TOOLSを移設
-    historyBuilder.js … 【小改修】発言者名付与
-    attachments.js    … 変更なし
-    settings.js       … router系削除
-    constants.js      … ROUTER_MODEL_DEFAULTS削除
-  ※削除: router.js / planner.js / finalizer.js / research.js / llm.js
-  ※削除（死骸）: deepseek.js / contextBuilder.js / channelSelector.js
-.gitignore            … settings.json を追加
-```
+### A-2. runAgent の伝搬（src/services/agent.js）
+- `runAgent({..., onAnswerDelta })` を追加し、各 `session.step()` に `onTextDelta: onAnswerDelta` として渡すだけ。Gemini/OpenAI/DeepSeekセッションは `onTextDelta` を無視してよい（シグネチャ上受け取って捨てる）。
 
-## 詳細設計
+### A-3. Discord逐次表示（src/services/streamReply.js 新規 + src/index.js）
+- 新規モジュール `streamReply.js`: `createStreamReply(channel, { throttleMs = 2500, softLimit = 1900, now })` → `{ update(fullText), finalize(fullText), reset() }` を返す。
+  - `update`: 2.5秒スロットルで「現在のメッセージ」を編集。初回テキスト到着時に最初のメッセージを `channel.send` で作る。表示中は末尾にカーソル `▌` を付ける。
+  - softLimit(1900字)超過時: 段落境界(`\n\n`)優先、なければ改行、なければ強制カットで現在メッセージを確定し、残りを新しいメッセージとして継続。確定済みメッセージは以後編集しない。
+  - `finalize(fullText)`: スロットル無視で最終状態に編集（カーソル除去）。全メッセージ2000字以内保証。テキスト全体が既送分＋現在分と一致するよう分割を完成させる。
+  - `reset()`: 途中までストリームしたがそのstepが回答ではなかった（tool_useで終わった）場合に、作ってしまったメッセージを全削除して初期状態に戻す。
+  - 時刻は `now` 関数を注入可能にしてユニットテスト可能にする（デフォルト `Date.now`）。Discordのedit/sendはawaitし、レートリミット例外はcatchして落ちないこと。
+- index.js MessageCreate側: `onAnswerDelta` で streamReply.update を呼ぶ。runAgent完了後、(a)ストリーム済みなら `finalize(answer)` して chunkMessage 送信はスキップ、(b)一度もdeltaが来ていなければ現行どおり chunkMessage で送る。ステータスメッセージ（⏳/ツールラベル/✅）は現行どおり別メッセージで維持。
+- 複数step間の混線対策: 各stepの累積テキストは0から始まる。stepがtool_useで終わった場合は index.js の `onToolCall` コールバック内（＝ツール実行後に必ず呼ばれる）で `streamReply.reset()` を呼ぶ。最終回答のstepだけがfinalizeに到達する。
+- /research（interaction）経路はストリーミング対象外（現行のdeferReply→editReply運用のまま）。
 
-### 1. `src/services/prompt.js`（新規）
+## 機能B: #ai-memory（自主参照方式）
 
-```js
-export function buildSystemPrompt(guild, aiChannelIds, { mode } = {}) {
-  // 戻り値: { persona: string, time: string }
-}
-```
+### B-1. ai-memory チャンネルの特例（src/index.js）
+- 現行の「`ai-` で始まるチャンネルをAIチャットチャンネルとして自動登録」処理で、**チャンネル名が正確に `ai-memory` のものだけは登録しない**（= botが会話反応しない）。判定は再利用可能な純関数（例: `isAiChatChannel(name)`）として切り出し、exportしてユニットテスト可能にする。登録箇所は複数ある可能性がある（起動時スキャン・ChannelCreate・GuildCreate等）ので全箇所をこの関数に統一する。
 
-- `persona`（安定部・キャッシュ対象）:
-  - アイデンティティ: 「あなたは「umineko」— このDiscordサーバーに常駐するAIエージェント。サーバーのチャンネル群があなたの記憶でありデータベースです。」
-  - サーバーの地図: サーバー名 + テキストチャンネル一覧（`#name [ID:xxx] (topic)`形式、ai-チャンネル=aiChannelIds は除外）
-  - 行動原則:
-    - サーバー固有の話題（人物・プロジェクト・過去の経緯・タスク）は推測せず、まず関連チャンネルを read_channel で読む。複数チャンネルは並列で読んでよい
-    - 一般知識・雑談はツールなしで直接答える。最新情報が答えを変える話題は search_web を使う
-    - 変更系ツール（送信・作成・編集・削除）はユーザーが明示的に依頼したときだけ使う。質問や相談には調査と提案で応じ、勝手に実行しない
-    - AI会話チャンネルの新設は名前を "ai-" で始める（自動的にAIチャンネルとして認識される）
-  - Discord形式規則（現行buildSystemWithToolsから移植）: メンション `<@数字ID>`・チャンネルリンク `<#ID>`・メッセージリンク形式・IDはツール結果か地図から取得し捏造禁止
-  - 出力規則: ユーザーと同じ言語 / 結論から / ツール実行中の途中経過ナレーション不要 / 内部処理(ツール・リトライ)に言及しない / 履歴の「名前:」プレフィックスは表示上の属性なので自分の発言には付けない
-- `mode: 'research'` のとき persona に追記: 「深掘りリサーチモード: search_web と fetch_url を徹底的に使い、複数の情報源を読み比べ、必ず引用元URLを付した包括的レポートを書く。Discordチャンネルの情報も必要なら読む。」
-- `time`（可変部・キャッシュ境界の後）: `現在時刻: {ja-JP, Asia/Tokyo, 分解像度} (JST)`
+### B-2. システムプロンプト（src/services/prompt.js）
+- チャンネル地図の除外は aiChannelIds ベースなので、ai-memory は登録されなくなれば自然に地図に載る。地図上で名前が `ai-memory` のチャンネルには `(あなたの長期記憶)` の注記を付ける。
+- ギルドに `ai-memory` テキストチャンネルが**存在するときだけ**、personaに「## 長期記憶 (#ai-memory)」セクションを追加:
+  - サーバー固有の人物・好み・決定事項・経緯が関わる質問では、まず #ai-memory を read_channel で読む。
+  - ユーザーに「覚えて」と言われたとき、または会話でサーバーに関する持続的な事実（好み・決定・役割）を得たときは、#ai-memory に send_message で保存する。1メッセージ=1事実、簡潔に。
+  - 古くなった記憶は delete_message（自分のメッセージのみ可）で消してから書き直す。
+  - **#ai-memory への send_message と自分のメッセージの delete_message に限り、明示依頼がなくても自律的に使ってよい**（「変更系ツールは明示依頼時のみ」の例外としてプロンプトに明記）。
+- ai-memory チャンネルが存在しないギルドではこのセクションを出さない。
 
-### 2. `src/services/provider.js`（大改修）
+### B-3. delete_message ツール（src/services/tools.js）
+- 新ツール `delete_message(channel_id, message_id)`: 対象メッセージをfetchし、**author.id が bot自身のときだけ削除**。他人のメッセージなら `権限エラー: 自分のメッセージ以外は削除できません。` をツール結果として返す（throwしない）。ADMIN_TOOLSには入れない。
+- bot自身のIDは `guild.client.user.id` または `guild.members.me?.id` で取得（executeToolの既存引数を壊さない最小の方法を選ぶ）。
+- toolLabel に delete_message 用ラベルを追加。TOOLSのdescriptionに「自分のメッセージのみ削除可。主に#ai-memoryの記憶更新に使う」旨を書く。
 
-**既存の`callText`/`callWithTools`エクスポートは削除**し、以下に置き換える:
-
-```js
-export function createAgentSession({ provider, model, effort, system, tools, seed })
-// system = { persona, time }
-// tools = OpenAI形式のツール定義配列（tools.jsのTOOLS）
-// seed  = [{ role:'user'|'assistant', content: string, images?: string[] }]
-// 戻り値: session
-
-session.step({ noTools = false } = {})
-// → Promise<{ text: string, toolCalls: [{id, name, arguments}]|null }>
-// noTools: 最終回答強制時にツールを渡さない
-
-session.addToolResults([{ id, text, images }])
-session.addUserText(text)  // nudge・最終回答要求用
-```
-
-プロバイダー解決は既存の`resolveProviderModel`を流用（provider未指定時はenvフォールバック）。
-
-**ClaudeAgentSession**（本命）:
-- 内部状態: Anthropicネイティブのmessages配列。seedは既存の`toClaudeMessages`ロジック（画像のbase64化含む）で**開始時に1回だけ**変換
-- `step()`: 既存`claudeFetch`（リトライ・Fable5フォールバック・300秒タイムアウト・effort/Haikuガードすべて現状維持）を呼ぶ。**レスポンスの`content`ブロック配列を一切加工せずそのまま**assistant turnとして内部配列にpush（thinking/text/tool_useブロック、signature含めて完全保存）。tool_useブロックがあれば`toolCalls`として返す
-- `addToolResults()`: 1つのuser turnにまとめ、各`{type:'tool_result', tool_use_id, content: [...]}` の content 配列に text ブロック + 画像があれば**imageブロックをネイティブ埋め込み**（画像は既存fetchImageAsBase64でbase64化）。現行の「合成userメッセージ」ハックは廃止
-- **プロンプトキャッシュ**: リクエストボディ組み立て時に（内部状態は汚さずシャローコピーで）
-  - system: `[identityブロック, personaブロック(cache_control: {type:'ephemeral'}), timeブロック]` の順。時刻はキャッシュ境界の後ろ
-  - messages末尾のブロックにも `cache_control: {type:'ephemeral'}` を付与（反復ごとに前反復までのプレフィックスがcache hitする）
-- **usageログ**: 毎step後に `console.log('[usage] model=... in=... cache_read=... cache_write=... out=...')`
-- 会話終端ガード（assistant終わり→`続けてください。`user挿入）は現行維持
-- prefill禁止対応・空応答warnログも現行維持
-
-**GeminiAgentSession**:
-- 内部状態: Geminiネイティブの`contents`配列。seedを既存`toGeminiContents`相当で1回変換、以降は`functionCall`パーツ（thoughtSignature含む）を**ネイティブのまま**追記
-- systemInstruction = persona + time 結合
-- 画像は無視（現状踏襲）。503/429リトライは現行維持
-
-**OpenAICompatSession**（openai / deepseek 共用）:
-- 内部状態: OpenAI形式messages（現行と同じ）。imagesフィールドは除去して送信（現状踏襲）
-- 503リトライ・max_completion_tokens/max_tokensの分岐は現行維持
-
-### 3. `src/services/tools.js`（新規 = llm.jsから移設）
-- `TOOLS`（DISCORD_TOOLS + WEB_TOOLS_DEFS、WEB_SEARCH_ENABLED分岐含む）
-- `executeTool(name, args, guild, aiChannelIds, member)`（ADMIN_TOOLSゲート含む・現行そのまま）
-- `executeToolInner`（全ケース現行そのまま。read_channel/fetch_messageの`{text, images}`戻り値も維持）
-- `toolLabel`
-- エクスポート: `TOOLS`, `executeTool`, `toolLabel`
-
-### 4. `src/services/agent.js`（新規）
-
-```js
-import { TOOLS, executeTool, toolLabel } from './tools.js';
-import { createAgentSession } from './provider.js';
-import { buildSystemPrompt } from './prompt.js';
-
-const MAX_ITERATIONS = 15;
-
-export async function runAgent({ settings, guild, member, aiChannelIds, seed, onToolCall, mode, maxIterations = MAX_ITERATIONS }) {
-  const system = buildSystemPrompt(guild, aiChannelIds, { mode });
-  const session = createAgentSession({
-    provider: settings.provider, model: settings.model, effort: settings.effort,
-    system, tools: TOOLS, seed,
-  });
-  for (let i = 0; i < maxIterations; i++) {
-    const { text, toolCalls } = await session.step();
-    if (!toolCalls?.length) {
-      if (text && text.trim()) return text;
-      // 空応答: 1回だけnudge
-      session.addUserText('ツールの実行結果を踏まえて、ユーザーへの回答を生成してください。');
-      const retry = await session.step({ noTools: true });
-      return retry.text || '';
-    }
-    const results = await Promise.all(
-      toolCalls.map((tc) => executeTool(tc.name, tc.arguments, guild, aiChannelIds, member))
-    );
-    results.forEach((r, j) => onToolCall?.(toolLabel(toolCalls[j].name, toolCalls[j].arguments, r.text)).catch?.(() => {}));
-    session.addToolResults(toolCalls.map((tc, j) => ({ id: tc.id, text: results[j].text, images: results[j].images })));
-  }
-  session.addUserText('収集した情報をもとに、最初の質問に最終回答してください。');
-  const final = await session.step({ noTools: true });
-  return final.text || '';
-}
-```
-（onToolCallがasyncな点の扱いは現行llm.jsの`await onToolCall(...).catch(()=>{})`パターンに合わせて良い）
-
-### 5. `src/services/historyBuilder.js`（小改修）
-- user発言（bot以外）の`content`を `${m.member?.displayName ?? m.author.username}: ${m.content}` に変更
-- bot自身（assistant）は現行どおり素のcontent
-- 画像・"> "フィルタ・50件は現行維持
-
-### 6. `src/index.js`（書き換え）
-
-**メッセージハンドラー**（MessageCreate）:
-```
-userImages = extractImageUrls(message)
-statusMsg = message.reply('> ⏳ 考え中...')
-history = buildConversationHistory(channel, message.id, client.user.id)
-authorName = message.member?.displayName ?? message.author.username
-seed = [...history, { role:'user', content: `${authorName}: ${message.content}`, ...(userImages.length ? {images:userImages} : {}) }]
-statusLines = []
-answer = await runAgent({ settings, guild: message.guild, member: message.member, aiChannelIds, seed,
-  onToolCall: async (label) => { statusLines.push(`> 🔧 ${label}`); await statusMsg.edit(...); } })
-statusMsg最終編集: statusLinesがあれば維持+`> ✅ 完了 (provider/model)`、なければ`> ✅ (provider/model)`
-answerを2000字以内チャンクで送信。チャンク分割は段落境界(\n\n)優先で自然に切る（新ヘルパーchunkMessage(text)をindex.js内に実装。段落単体が2000超の場合は行、それも超えるなら文字で切る）
-```
-- Router/History/Plan/Finalizeのステータス行と分岐はすべて削除
-- timeContextの組み立てはprompt.jsに移ったのでハンドラーから削除
-- try/catchでの`❌ [Error]`表示は現行維持
-
-**/research ハンドラー**（置き換え）:
-```
-deferReply → history取得 → seed = [...history, {role:'user', content:`${authorName}: [リサーチ依頼] ${query}`}]
-runAgent({ ..., mode:'research', maxIterations: 25, onToolCall: editReplyでステータス行追加 })
-結果をchunkMessageで分割し、最初のchunkをfollowUp、残りをchannel.send（現行踏襲）
-```
-- 全チャンネルユーザー発言スキャン（Step2）・プロフィール抽出（Step3）・planResearch（Step4）は**廃止**（ユーザー確認済み）
-
-**/ai コマンド**:
-- `router` / `router-model` サブコマンド定義とハンドラーを削除
-- `status`: ルーター行を削除（メインAI・Effortのみ）
-- `reset`: ルーター行を削除
-- それ以外（model / effort / reset本体）は現状維持
-
-**import整理**: classify / planSearch / finalizeResponse / runResearch / planResearch / extractUserContext / chatSimple / chatWithTools / SYSTEM_SIMPLE / buildSystemWithTools / resolveRouterModel / ROUTER_MODEL_DEFAULTS を削除し、runAgent / buildConversationHistory / extractImageUrls / settings系のみに
-
-### 7. `src/services/settings.js` / `constants.js`
-- settings: ENV_DEFAULTSから`routerProvider`/`routerModel`削除、`resolveRouterModel`削除、re-exportからROUTER_MODEL_DEFAULTS削除
-- constants: `ROUTER_MODEL_DEFAULTS`削除（MODEL_DEFAULTS・PROVIDERS・EFFORT_LEVELSは維持）
-- settings.jsonに残る旧キー（routerProvider等）は無視されるだけなので移行処理不要
-
-### 8. 削除
-`git rm`: `src/services/router.js`, `planner.js`, `finalizer.js`, `research.js`, `llm.js`, `deepseek.js`, `contextBuilder.js`, `channelSelector.js`
-`.gitignore`に`settings.json`を追加
-
-## 変更してよい範囲
-上記に列挙したファイルのみ。`windows-search-api/`・`.env`・`Dockerfile`・`scripts/deploy.sh`は触らない。
+## 機能C（ストレッチ・失敗したら撤退）: thinking要約ステータス
+- Fable 5 のthinking要約表示を**1回だけ**プローブ: `output_config: { thinking: { display: 'summarized' } }` を付けた小リクエスト（fable-5, 短いプロンプト）を試し、400なら別の妥当な形を**最大もう1回だけ**試す。通らなければ**実装せず撤退**し、プローブ結果（送ったパラメータと返ったエラー本文）を報告に書く。
+- 通った場合のみ: ストリーミング中の thinking_delta（要約テキスト）を `onThinkingDelta` としてrunAgent→index.jsに流し、ステータスメッセージを `> 🧠 <要約の末尾80字>` に2.5sスロットルで編集。回答テキストが流れ始めたらステータス更新をやめる。
 
 ## 禁止事項
-- 既存の`claudeFetch`の挙動（OAuth認証ヘッダー・リトライ・Fable5フォールバック・タイムアウト300s・effort/Haikuガード・max_tokens 16000）を変えない
-- 画像のbase64方式（URL直接方式はこのOAuth経路で400になる。.ai/lessons.md参照）を変えない
-- デプロイしない（親エージェントが行う）。コミットもしない
-- reasonix-do / DeepSeek系外部LLMへの新規連携追加禁止
+- claudeFetch のOAuthヘッダー・リトライ・Fable5フォールバック挙動の変更禁止（ストリーミング時のアイドルタイムアウト追加を除く）
+- 画像base64方式・thinkingのverbatim保存・cache_control配置（identity→persona(cache)→time、最終メッセージ末尾ブロック）の変更禁止
+- Gemini/OpenAI/DeepSeekセッションの動作変更禁止（onTextDelta無視の追加のみ可）
+- git commit / push / デプロイ禁止（親がやる）
+- reasonix-do / DeepSeek / 外部LLM APIの新規利用禁止（無退行確認のためのdeepseek-chat 1回実行のみ可）
+- 勝手な仕様変更・大規模リファクタ・関係ない変更・長文ログ貼り付け禁止
 
-## 実装のヒント
-- `.env`に実トークンあり。統合テストは実APIで行う（モック禁止）。一時スクリプトはプロジェクト直下に置き、終了後削除
-- リクエストボディの検証は `globalThis.fetch` をラップして捕捉するパターンが使える（過去の検証で実績あり）
-- 着手前に `.ai/lessons.md` を必ず読むこと
-
-## 失敗時
-`.ai/failure-log.md`に1行追記。
+## 検証（実装者セルフチェック。盲検verifierは別途走る）
+- `find src -name "*.js" | xargs -n1 node --check`
+- 実API（.envのトークン）でストリーミングstepの動作確認。**コスト注意: テストは原則 claude-haiku-4-5-20251001。fable-5 は「ストリーミング下のthinkingリプレイ確認」と機能Cプローブだけに使う**
+- streamReply のユニットテスト（フェイクchannel/message + 注入クロック）
+- isAiChatChannel のユニットテスト
+- 15秒起動スモーク（`Ready! Logged in as` 確認）
+- 一時テストスクリプトはプロジェクト直下に作り、終了後削除

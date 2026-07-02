@@ -13,6 +13,7 @@ export async function runAgent({
   aiChannelIds,
   seed,
   onToolCall,
+  onAnswerDelta,
   mode,
   maxIterations = MAX_ITERATIONS,
 }) {
@@ -27,13 +28,13 @@ export async function runAgent({
   });
 
   for (let i = 0; i < maxIterations; i++) {
-    const { text, toolCalls } = await session.step();
+    const { text, toolCalls } = await session.step({ onTextDelta: onAnswerDelta });
 
     if (!toolCalls?.length) {
       if (text && text.trim()) return text;
       // 空応答: 1回だけnudgeして最終回答を強制
       await session.addUserText('ツールの実行結果を踏まえて、ユーザーへの回答を生成してください。');
-      const retry = await session.step({ noTools: true });
+      const retry = await session.step({ noTools: true, onTextDelta: onAnswerDelta });
       return retry.text || '';
     }
 
@@ -54,6 +55,6 @@ export async function runAgent({
 
   // ループ上限到達: ツールなしで最終回答を強制
   await session.addUserText('収集した情報をもとに、最初の質問に最終回答してください。');
-  const final = await session.step({ noTools: true });
+  const final = await session.step({ noTools: true, onTextDelta: onAnswerDelta });
   return final.text || '';
 }

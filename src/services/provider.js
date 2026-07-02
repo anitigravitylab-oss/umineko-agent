@@ -153,7 +153,113 @@ async function toClaudeMessages(messages) {
 // refusal is transparently retried on Opus 4.8 within the same request.
 const FABLE5_MODEL = 'claude-fable-5';
 
-async function claudeFetch(body) {
+// ── SSEストリーミング（Claude） ───────────────────────────────────────
+// stream:trueのレスポンスを、非ストリーミング時のres.json()と同じ形
+// ({ model, content, stop_reason, usage }) に再組み立てする。こうすることで
+// step()側は非ストリーミング/ストリーミングを区別せず同じ後処理で扱える。
+// onTextDeltaはtext_deltaのたびに累積テキスト全体で呼ぶ（thinkingのテキスト
+// は流さない）。signature_deltaを落とすと次反復のthinkingリプレイがAPIに
+// 拒否されるので必ずthinkingブロックのsignatureに保存する。
+async function parseClaudeSSEStream(body, onTextDelta, resetIdle) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let eventName = 'message';
+  let dataLines = [];
+
+  const blocks = [];
+  let cumulativeText = '';
+  let model = null;
+  let stopReason = null;
+  let usage = {};
+
+  async function applyDelta(index, delta) {
+    const block = blocks[index];
+    if (!block || !delta) return;
+    if (delta.type === 'text_delta') {
+      block.text = (block.text ?? '') + delta.text;
+      cumulativeText += delta.text;
+      if (onTextDelta) await onTextDelta(cumulativeText);
+    } else if (delta.type === 'thinking_delta') {
+      block.thinking = (block.thinking ?? '') + delta.thinking;
+    } else if (delta.type === 'signature_delta') {
+      block.signature = (block.signature ?? '') + delta.signature;
+    } else if (delta.type === 'input_json_delta') {
+      block._partialJson = (block._partialJson ?? '') + (delta.partial_json ?? '');
+    }
+  }
+
+  async function handleEvent(evt, dataStr) {
+    if (evt === 'ping' || !dataStr) return;
+    const data = JSON.parse(dataStr);
+    if (evt === 'error') {
+      // 既存のリトライループ（claudeFetchのattemptループ）に乗せるためthrow
+      throw new Error(`Claude SSE error event: ${JSON.stringify(data).slice(0, 300)}`);
+    }
+    if (evt === 'message_start') {
+      model = data.message?.model ?? model;
+      usage = { ...usage, ...(data.message?.usage ?? {}) };
+    } else if (evt === 'content_block_start') {
+      blocks[data.index] = { ...data.content_block };
+    } else if (evt === 'content_block_delta') {
+      await applyDelta(data.index, data.delta);
+    } else if (evt === 'content_block_stop') {
+      const block = blocks[data.index];
+      if (block && block.type === 'tool_use') {
+        const raw = (block._partialJson ?? '').trim();
+        block.input = raw ? JSON.parse(raw) : {};
+        delete block._partialJson;
+      }
+    } else if (evt === 'message_delta') {
+      if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;
+      usage = { ...usage, ...(data.usage ?? {}) };
+    }
+    // message_stop等は組み立てに不要なので無視
+  }
+
+  async function processLine(line) {
+    if (line === '') {
+      if (dataLines.length) await handleEvent(eventName, dataLines.join('\n'));
+      eventName = 'message';
+      dataLines = [];
+      return;
+    }
+    if (line.startsWith(':')) return; // SSEコメント行
+    const sep = line.indexOf(':');
+    const field = sep === -1 ? line : line.slice(0, sep);
+    let value = sep === -1 ? '' : line.slice(sep + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    if (field === 'event') eventName = value;
+    else if (field === 'data') dataLines.push(value);
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value?.length) resetIdle?.();
+      // チャンク境界で行が割れるケースに対応するため、行単位でバッファリング
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        let line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        await processLine(line);
+      }
+    }
+    buf += decoder.decode();
+    if (buf.endsWith('\r')) buf = buf.slice(0, -1);
+    if (buf) await processLine(buf);
+    await processLine(''); // 末尾に空行がなかった場合の最終イベントをflush
+  } finally {
+    try { reader.releaseLock(); } catch { /* noop */ }
+  }
+
+  return { model, content: blocks.filter(Boolean), stop_reason: stopReason, usage };
+}
+
+async function claudeFetch(body, { onTextDelta } = {}) {
   const token = getClaudeToken();
   if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is not set');
   const betas = ['oauth-2025-04-20'];
@@ -161,33 +267,62 @@ async function claudeFetch(body) {
     betas.push('server-side-fallback-2026-06-01');
     body = { ...body, fallbacks: [{ model: 'claude-opus-4-8' }] };
   }
+  const streaming = typeof onTextDelta === 'function';
+  if (streaming) body = { ...body, stream: true };
+  const headers = {
+    'content-type': 'application/json',
+    'anthropic-version': '2023-06-01',
+    'anthropic-beta': betas.join(','),
+    authorization: `Bearer ${token}`,
+  };
   const MAX_RETRIES = 3;
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let res;
+    // ストリーミング時は「60秒間データが1バイトも来なければabort」のアイドル
+    // タイムアウト（受信のたびにresetIdleでリセット。fetch開始時にも一度
+    // セットするのでヘッダー到達待ちも60秒でタイムアウトする）。非ストリー
+    // ミング経路は現行どおり全体300s固定のまま変更しない。
+    let idleTimer;
+    const idleController = streaming ? new AbortController() : null;
+    const resetIdle = () => {
+      if (!idleController) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => idleController.abort(new Error('Claude stream idle timeout (60s)')), 60000);
+    };
     try {
+      resetIdle();
       res = await fetch(`${ANTHROPIC_BASE}/v1/messages`, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'anthropic-version': '2023-06-01',
-          'anthropic-beta': betas.join(','),
-          authorization: `Bearer ${token}`,
-        },
+        headers,
         body: JSON.stringify(body),
         // Fable 5 / Sonnet 5 think on every call (adaptive-by-default when the
         // `thinking` param is omitted, which we always do) and can legitimately
         // take several minutes on demanding tool-loop turns — confirmed via a
         // live 16k-max_tokens request that took ~165s. 120s was killing those
         // requests mid-generation before the fix.
-        signal: AbortSignal.timeout(300000),
+        signal: streaming ? idleController.signal : AbortSignal.timeout(300000),
       });
     } catch (e) {
+      clearTimeout(idleTimer);
       lastErr = e;
       if (attempt < MAX_RETRIES) { await sleep(attempt * 3000); continue; }
       throw e;
     }
-    if (res.ok) return res.json();
+    if (res.ok) {
+      if (!streaming) { clearTimeout(idleTimer); return res.json(); }
+      try {
+        const result = await parseClaudeSSEStream(res.body, onTextDelta, resetIdle);
+        clearTimeout(idleTimer);
+        return result;
+      } catch (e) {
+        clearTimeout(idleTimer);
+        lastErr = e;
+        if (attempt < MAX_RETRIES) { await sleep(attempt * 3000); continue; }
+        throw e;
+      }
+    }
+    clearTimeout(idleTimer);
     const errText = await res.text().catch(() => '');
     if (isClaudeRetryable(res.status) && attempt < MAX_RETRIES) {
       console.warn(`[provider] Claude ${res.status} attempt ${attempt}, retrying in ${attempt * 3}s...`);
@@ -251,7 +386,7 @@ class ClaudeAgentSession {
     });
   }
 
-  async step({ noTools = false } = {}) {
+  async step({ noTools = false, onTextDelta } = {}) {
     await this._ready;
     const resolvedEffort = resolveClaudeEffort(this.effort, this.model);
     const data = await claudeFetch({
@@ -268,7 +403,7 @@ class ClaudeAgentSession {
       ...(noTools ? {} : { tools: toClaudeTools(this.tools) }),
       messages: this._requestMessages(),
       ...(resolvedEffort ? { output_config: { effort: resolvedEffort } } : {}),
-    });
+    }, { onTextDelta });
     const blocks = data.content ?? [];
     // レスポンスブロックを無加工でassistantターンとして保存
     if (blocks.length) this.messages.push({ role: 'assistant', content: blocks });
@@ -331,7 +466,9 @@ class GeminiAgentSession {
       }));
   }
 
-  async step({ noTools = false } = {}) {
+  // onTextDeltaはClaude系ストリーミング専用。Geminiは非対応なのでシグネチャ
+  // 上だけ受け取って捨てる（呼び出し元のrunAgentは全プロバイダーに一律で渡す）。
+  async step({ noTools = false, onTextDelta } = {}) {
     const MAX_GEMINI_RETRIES = 3;
     let lastErr;
     let response;
@@ -407,7 +544,9 @@ class OpenAICompatSession {
     ];
   }
 
-  async step({ noTools = false } = {}) {
+  // onTextDeltaはClaude系ストリーミング専用。OpenAI互換は非対応なのでシグネ
+  // チャ上だけ受け取って捨てる（呼び出し元のrunAgentは全プロバイダーに一律で渡す）。
+  async step({ noTools = false, onTextDelta } = {}) {
     const MAX_RETRIES = 3;
     let lastError;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {

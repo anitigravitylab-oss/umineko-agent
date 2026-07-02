@@ -1,43 +1,46 @@
-# 合格基準（rubric）— umineko v2 単一ループ化
+# 合格基準（rubric）— Phase 2: ストリーミング + #ai-memory
 
-実装の経緯は見ずに、現在のコードと実際の動作だけで以下を機械的に照合すること。曖昧な場合は不合格側に倒す。`.env`の実トークンを使い、一時スクリプトはプロジェクト直下に作成し実行後削除すること（モック禁止。ただしDiscordのguild/channel/memberはフェイクオブジェクトでよい）。
+実装の経緯は見ずに、現在のコード（mainとの差分）と実際の動作だけで機械的に照合すること。曖昧な場合は不合格側に倒す。`.env`の実トークンを使い、一時スクリプトはプロジェクト直下に作成し実行後削除（LLM APIのモック禁止。Discordのguild/channel/message/memberはフェイクでよい）。コスト注意: 実APIテストは原則 `claude-haiku-4-5-20251001`。`claude-fable-5` は項目2-4（thinkingリプレイ）のみに使う。
 
 ## 1. 構成
-- [ ] 新規: `src/services/agent.js`（`runAgent`をexport）, `src/services/prompt.js`（`buildSystemPrompt`をexport）, `src/services/tools.js`（`TOOLS`/`executeTool`/`toolLabel`をexport）が存在
-- [ ] 削除済み: `src/services/router.js`, `planner.js`, `finalizer.js`, `research.js`, `llm.js`, `deepseek.js`, `contextBuilder.js`, `channelSelector.js` が存在しない
-- [ ] `grep -rn "router\.js\|planner\.js\|finalizer\.js\|research\.js\|llm\.js" src/` でimportが残っていない
-- [ ] `provider.js` が `callText`/`callWithTools` をexportしていない（`createAgentSession`のみ）
-- [ ] `.gitignore` に `settings.json` がある
+- [ ] `src/services/streamReply.js` が存在し、update/finalize/reset 相当を提供
+- [ ] `runAgent` が `onAnswerDelta` を受け取り session.step に伝搬する
+- [ ] `tools.js` の TOOLS に `delete_message` があり、ADMIN_TOOLS には含まれない
+- [ ] `index.js` が AIチャットチャンネル判定の純関数（`isAiChatChannel` 相当）をexportし、全登録箇所で使っている
 - [ ] 全srcファイルが `node --check` を通る
+- [ ] `timeout 17 node src/index.js` で `Ready! Logged in as umineko-agent#3789`、起動エラーなし
 
-## 2. 起動と基本動作
-- [ ] `node src/index.js` を15秒起動し `Ready! Logged in as umineko-agent#3789` が出て、起動エラーがない
-- [ ] `/ai` コマンド定義に `router` / `router-model` サブコマンドが存在しない（index.jsのAI_COMMAND定義を確認）
+## 2. ストリーミング（実API・fetchフックで生リクエスト/レスポンス捕捉）
+- [ ] **逐次コールバック**: ClaudeAgentSession（haiku可）で `step({onTextDelta})` を呼ぶと、`stream:true` がリクエストボディに載り、onTextDelta が2回以上・単調増加する累積テキストで呼ばれ、最終的な step 戻り値 text と最後のコールバック値が一致する
+- [ ] **非ストリーミング経路の温存**: onTextDelta を渡さない step は `stream` を送らない（従来動作）
+- [ ] **ツールループがストリーミングで完走**: フェイクguild read_channel を仕込み、onTextDelta ありで2反復以上のループが完走し、tool_use の input が正しく組み立てられている（input_json_delta の再組み立て）
+- [ ] **thinkingリプレイ（fable-5・このrubricの核心）**: 分析を要するタスク（複数チャンネルの突き合わせ等）を onTextDelta ありで実行。1回目のレスポンスに thinking ブロックがあることを前提確認した上で、**2回目のリクエストの messages に thinking ブロックが signature 付きで含まれ、APIが400を返さない**こと（SSE再組み立てで signature_delta が保存されている証拠）。thinking のテキストが onTextDelta に混入しないことも確認
+- [ ] **キャッシュ無退行**: 同ループで2回目レスポンスの cache_read_input_tokens > 0、[usage]ログが出る
+- [ ] **アイドルタイムアウト**: ストリーミング経路に「無通信60秒でabort」の実装がある（コードレビューで確認。タイマーがチャンク受信ごとにリセットされる構造であること）
 
-## 3. コア動作（実API・フェイクguild）
-- [ ] **雑談（ツール不使用）**: `runAgent` に「こんにちは」相当のseedを渡し、ツール呼び出しゼロで応答が返る（claude-haiku で可）
-- [ ] **調査（ツール使用）**: フェイクguildの`read_channel`に既知の内容を仕込み、「#generalの話題を教えて」で read_channel が呼ばれ、内容を踏まえた応答が返る
-- [ ] **管理者ゲート**: 非管理者member（`permissions.has: ()=>false`）で create_channel を依頼→権限エラーがツール結果として返り、応答にその旨が反映される
-- [ ] **ループ上限**: maxIterations を 2 に絞り、ツールを呼び続けるよう誘導した場合でも最終回答が文字列で返る（無限ループしない）
+## 3. Discord逐次表示（ユニット・フェイクchannel + 注入クロック）
+- [ ] 初回 update でメッセージが send され、スロットル窓内の連続 update は edit を発生させない（注入クロックで検証）
+- [ ] 2.5秒経過後の update で edit が走り、表示中テキスト末尾にカーソル（▌）が付く
+- [ ] 1900字超で段落境界優先の分割が起き、確定メッセージ＋新メッセージに継続。finalize 後の全メッセージを結合すると最終テキストと一致し、各メッセージ2000字以内
+- [ ] reset() が送信済みメッセージを削除して初期状態に戻す
+- [ ] **リトライ再描画**: update に「前回より短い（縮んだ）fullText」を渡すと再スタートと判定され、送信済みメッセージが破棄されてゼロから描画し直される（ストリーム途中リトライで古い試行のテキストが画面に残らない）。1900字分割確定後に縮んだfullTextが来るケースをユニットで確認
+- [ ] index.js: ストリーム済みなら chunkMessage 送信をスキップ、delta ゼロなら chunkMessage 送信（コードレビューで分岐を確認）。tool_use で終わる step の後に reset が呼ばれる経路がある
 
-## 4. Claude品質修復の実証（fetchフックでリクエストボディを捕捉）
-- [ ] **thinkingブロック保存**: `claude-fable-5` で2反復以上のツールループを実行し、**2回目のAPIリクエストのmessages内にtype:"thinking"ブロックが含まれる**ことを確認（現行v1では毎回消失していた。これがこのリファクタの核心）。注意: Fable 5は自明すぎるツール呼び出しではthinkingブロックを出さないことがあるため、分析を要するタスク（例:「#generalを読んで議論の対立点を整理して」）で誘発すること。まず**1回目のレスポンスにthinkingブロックが存在すること**を前提確認し、存在するのに2回目のリクエストに含まれていない場合のみ不合格とする
-- [ ] **プロンプトキャッシュ**: 同ループで2回目以降のレスポンスの `usage.cache_read_input_tokens > 0` を確認。また[usage]ログが出力される
-- [ ] **時刻の位置**: リクエストのsystem配列で、cache_controlが付くpersonaブロックより**後**に時刻ブロックがある（時刻がキャッシュを壊さない配置）
-- [ ] **画像のネイティブ埋め込み**: フェイクguildのread_channelで画像添付メッセージを返し、次のリクエストの `tool_result.content` 内に `type:"image"` ブロックが含まれる（旧・合成userメッセージ方式が廃止されている）。かつ実画像（猫URL可）で応答が画像内容に言及する
-- [ ] **prefillガード**: seed末尾がassistantになるケース（`[user, assistant]`）でエラーにならない
+## 4. #ai-memory
+- [ ] `isAiChatChannel('ai-chat')` → true、`isAiChatChannel('ai-memory')` → false、`isAiChatChannel('general')` → false
+- [ ] buildSystemPrompt: フェイクguildに `ai-memory` チャンネルあり → personaに長期記憶セクション（read_channel での参照、send_message での保存、delete_message での更新、自律使用の例外明記）が含まれ、地図に `ai-memory` が記憶注記付きで載る
+- [ ] buildSystemPrompt: `ai-memory` なしのguild → 長期記憶セクションが出ない
+- [ ] delete_message 実機能（フェイク）: bot自身のメッセージ → delete が呼ばれ成功文言。他人のメッセージ → `権限エラー` 文言が返り delete は呼ばれない
+- [ ] toolLabel('delete_message', ...) が意味のあるラベルを返す
 
-## 5. 無退行（他プロバイダー）
-- [ ] **Gemini**: `gemini-2.5-flash` でツールループ（フェイクguild read_channel）が1周し正常応答
-- [ ] **DeepSeek**: `deepseek-chat` で雑談が正常応答（残高不足エラーの場合はその旨明記でスキップ可）
-- [ ] **OpenAI**: OPENAI_API_KEY未設定ならスキップ可（明記）
-- [ ] **4 Claudeモデル**: fable-5 / opus-4-8 / sonnet-5 / haiku-4-5 の一発応答（haikuはeffortが送られない=エラーにならないことも兼ねる）
+## 5. 無退行
+- [ ] 雑談（ツールなし・haiku・非ストリーミング）が従来どおり動く
+- [ ] Gemini `gemini-2.5-flash` のツールループ1周が従来どおり動く（onAnswerDelta を渡しても壊れない）
+- [ ] 画像: read_channel ツール結果の画像が tool_result 内 type:"image"（base64）で送られる（非ストリーミングで確認可）
+- [ ] chunkMessage のユニット（2000字以内・段落境界優先）が引き続き成立
 
-## 6. 周辺
-- [ ] **履歴の発言者付与**: フェイクmessage群からbuildConversationHistoryを呼び、user turnのcontentが `表示名: 内容` 形式、bot turnは素のまま
-- [ ] **チャンク分割**: 2000字超のテキストがchunkMessage相当で全チャンク2000字以内かつ段落境界優先で分割される（ユニット確認）
-- [ ] **/research**: index.jsの/researchハンドラーが `mode:'research'` で runAgent を呼ぶ実装になっている（コードレビューで確認。全チャンネルスキャン・プロフィール抽出コードが残っていない）
-- [ ] **systemプロンプト内容**: buildSystemPromptの出力に (a)チャンネル地図 (b)「変更系ツールは明示依頼時のみ」の行動境界 (c)Discord形式規則 (d)ai-プレフィックス規則 が含まれる
+## 6. 機能C（条件付き）
+- [ ] thinking要約ステータスが実装されている場合のみ: fable-5 で thinking 要約テキストが取得でき、ステータス編集コールバックに流れる。未実装の場合: 実装しない判断の根拠（プローブで送ったパラメータ・返ったエラー）が verifier-report ではなく実装報告に記載されているはず — verifier は「機能Cのコードが中途半端に残っていない（死にコードなし）」ことだけ確認
 
 ## 7. 総合判定
 全項目合格なら `.ai/verifier-report.md` に合格と各項目の根拠を記録。不合格項目は具体的な失敗内容を明記。
