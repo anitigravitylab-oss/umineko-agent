@@ -4,11 +4,21 @@ import { ChannelType } from 'discord.js';
 // 戻り値を { persona, time } に分けているのは、persona（安定部）を
 // プロンプトキャッシュの対象にし、毎分変わる時刻をキャッシュ境界の
 // 後ろに置くため（provider.js の各セッションが配置を決める）。
+const AI_MEMORY_CHANNEL_NAME = 'ai-memory';
+
 export function buildSystemPrompt(guild, aiChannelIds, { mode } = {}) {
   const channelList = guild.channels.cache
     .filter((c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id))
-    .map((c) => `#${c.name} [ID:${c.id}]${c.topic ? ` (${c.topic})` : ''}`)
+    .map((c) => {
+      const topicPart = c.topic ? ` (${c.topic})` : '';
+      const memoryNote = c.name === AI_MEMORY_CHANNEL_NAME ? ' (あなたの長期記憶)' : '';
+      return `#${c.name} [ID:${c.id}]${topicPart}${memoryNote}`;
+    })
     .join('\n');
+
+  const hasMemoryChannel = guild.channels.cache.some(
+    (c) => c.type === ChannelType.GuildText && c.name === AI_MEMORY_CHANNEL_NAME
+  );
 
   let persona = `あなたは「umineko」— このDiscordサーバーに常駐するAIエージェント。サーバーのチャンネル群があなたの記憶でありデータベースです。
 
@@ -36,6 +46,16 @@ ${channelList || '(なし)'}
 - ツール実行中の途中経過ナレーションは不要
 - 内部処理（ツールやリトライなど）には言及しない
 - 会話履歴のユーザー発言には「名前: 」プレフィックスが付いているが、これは表示上の属性。自分の発言には付けない`;
+
+  if (hasMemoryChannel) {
+    persona += `
+
+## 長期記憶 (#ai-memory)
+- サーバー固有の人物・好み・決定事項・経緯が関わる質問では、まず #ai-memory を read_channel で読む。
+- ユーザーに「覚えて」と言われたとき、または会話でサーバーに関する持続的な事実（好み・決定・役割）を得たときは、#ai-memory に send_message で保存する。1メッセージ=1事実、簡潔に。
+- 古くなった記憶は delete_message（自分のメッセージのみ可）で消してから書き直す。
+- #ai-memory への send_message と自分のメッセージの delete_message に限り、「変更系ツールは明示依頼時のみ」の例外として、明示依頼がなくても自律的に使ってよい。`;
+  }
 
   if (mode === 'research') {
     persona += `
