@@ -5,6 +5,7 @@ import { runAgent } from './services/agent.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { extractImageUrls } from './services/attachments.js';
 import { createStreamReply } from './services/streamReply.js';
+import { clearPersonaConfigCache } from './services/personaConfig.js';
 import {
   getGuildSettings,
   updateGuildSettings,
@@ -135,16 +136,18 @@ function isGuildAllowed(guildId) {
 
 // ── AI_CHANNEL_PREFIX ────────────────────────────────────────────────
 const AI_CHANNEL_PREFIX = process.env.AI_CHANNEL_PREFIX || 'ai-';
-// #ai-memory はbotの長期記憶専用チャンネル特例。"ai-"プレフィックスに
-// マッチしても自動登録せず（＝会話に反応しない）、プロンプト側からの
-// 自主参照・自主書き込み専用にする（prompt.js / tools.js側の対応と対）。
-const AI_MEMORY_CHANNEL_NAME = 'ai-memory';
+// #ai-memory（長期記憶）・#ai-config（ペルソナ設定）はbot専用チャンネル特例。
+// "ai-"プレフィックスにマッチしても自動登録せず（＝会話に反応しない）、
+// プロンプト側からの自主参照・自主書き込み専用にする
+// （prompt.js / tools.js / personaConfig.js側の対応と対）。
+const AI_SPECIAL_CHANNEL_NAMES = new Set(['ai-memory', 'ai-config']);
+const AI_CONFIG_CHANNEL_NAME = 'ai-config';
 const aiChannelIds = new Set();
 
 // 純関数（チャンネル名だけを見る）。登録箇所（起動時スキャン・GuildCreate・
 // ChannelCreate）を全てこれに統一し、ユニットテスト可能にする。
 export function isAiChatChannel(name) {
-  return name.startsWith(AI_CHANNEL_PREFIX) && name !== AI_MEMORY_CHANNEL_NAME;
+  return name.startsWith(AI_CHANNEL_PREFIX) && !AI_SPECIAL_CHANNEL_NAMES.has(name);
 }
 
 function isAiChannelCandidate(channel) {
@@ -194,6 +197,22 @@ client.on(Events.ChannelDelete, (channel) => {
   if (aiChannelIds.has(channel.id)) {
     aiChannelIds.delete(channel.id);
     console.log(`AI channel unregistered: #${channel.name} (${channel.id})`);
+  }
+});
+
+// #ai-config のピン留め・トピック変更をTTLを待たず即座にpersonaへ反映する。
+client.on(Events.ChannelPinsUpdate, (channel) => {
+  if (channel.guild && channel.name === AI_CONFIG_CHANNEL_NAME) {
+    clearPersonaConfigCache(channel.guild.id);
+  }
+});
+
+client.on(Events.ChannelUpdate, (oldChannel, newChannel) => {
+  if (!newChannel.guild) return;
+  // 改名でai-configになった/でなくなった、またはトピック変更（名前は
+  // ai-configのまま）のいずれもnewChannel.name判定でカバーされる。
+  if (oldChannel.name === AI_CONFIG_CHANNEL_NAME || newChannel.name === AI_CONFIG_CHANNEL_NAME) {
+    clearPersonaConfigCache(newChannel.guild.id);
   }
 });
 

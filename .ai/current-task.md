@@ -1,71 +1,65 @@
-# Phase 2: ストリーミング + #ai-memory（自主参照方式）
+# Phase 3: ペルソナカスタマイズ（#ai-config） + README全面改訂
 
-前提: v2単一ループアーキテクチャ（runAgent / createAgentSession / buildSystemPrompt / tools.js）はmainにマージ・本番稼働済み。このタスクはその上に2機能を足す。作業ブランチ: `feat/streaming-ai-memory`（main から分岐済み。コミットは親が行うので不要）。
+前提: v2単一ループ + ストリーミング + #ai-memory はmainにマージ・本番稼働済み。作業ブランチ: `feat/persona-config-readme`（mainから分岐済み。コミットは親が行うので不要）。
 
-## 機能A: Claude系ストリーミング
+## 機能A: #ai-config によるギルド別ペルソナカスタマイズ
 
-### A-1. ClaudeAgentSession.step() のSSE対応（src/services/provider.js）
-- `step({ noTools, onTextDelta } = {})` に拡張。`onTextDelta` が渡されたときだけ `stream: true` でリクエストする（渡されなければ現行の非ストリーミングのまま）。
-- SSEパース: fetchのbody ReadableStreamをTextDecoderで行単位バッファリング（チャンク境界で行が割れるケースを必ず処理）。`event:` / `data:` 行を解釈。`ping`イベントは無視。`error`イベントは例外をthrow（既存のリトライループに乗せる）。
-- コンテンツブロック再組み立て: `content_block_start`/`content_block_delta`/`content_block_stop` から、非ストリーミング時と等価なblocks配列を復元する。
-  - `text_delta` → textブロックに追記。追記のたびに `onTextDelta(累積テキスト全体)` を呼ぶ（差分ではなく累積を渡す）。
-  - `thinking_delta` → thinkingブロックのthinkingフィールドに追記。**`signature_delta` → thinkingブロックのsignatureに格納。これを落とすと次反復のリプレイがAPIに拒否されるので絶対に落とさない。**
-  - `input_json_delta` → tool_useブロックのpartial_jsonを蓄積し、`content_block_stop` で `JSON.parse` して input に格納（空文字列は `{}` 扱い）。
-  - thinkingのテキストは `onTextDelta` に流さない（回答テキストのみ）。
-- `message_delta` から stop_reason と usage を取得し、既存の `[usage]` ログを同形式で出す（cache_read等含む）。
-- 組み立てたblocksは非ストリーミング時と同じく **verbatimで this.messages に保存**（thinking含む）。ここの挙動差ゼロが最重要。
-- リクエスト成功後にのみ this.messages を変更する（ストリーム途中死→リトライで会話状態が壊れない）。
-- claudeFetch のOAuthヘッダー・betas・リトライ回数・Fable5フォールバックは一切変更しない。ストリーミング時のタイムアウトのみ変更: 全体300s固定ではなく「**60秒間データが1バイトも来なければabort**」のアイドルタイムアウト（AbortController + チャンク受信ごとにタイマーリセット）。非ストリーミング経路は現行の `AbortSignal.timeout(300000)` のまま。
+### 設計
+チャンネル名が正確に `ai-config` のテキストチャンネルがあるギルドでは、その**トピック**と**ピン留めメッセージ**をsystemプロンプトのpersonaに注入する。トピック変更は「チャンネルの管理」、ピン留めは「メッセージの管理」権限が要るため、実質サーバー管理側だけがペルソナを制御できる（通常メッセージは注入しない）。
 
-### A-2. runAgent の伝搬（src/services/agent.js）
-- `runAgent({..., onAnswerDelta })` を追加し、各 `session.step()` に `onTextDelta: onAnswerDelta` として渡すだけ。Gemini/OpenAI/DeepSeekセッションは `onTextDelta` を無視してよい（シグネチャ上受け取って捨てる）。
+### A-1. チャンネル特例（src/index.js）
+- `isAiChatChannel` の除外に `ai-config` を追加（`ai-memory` と同様、AIチャット自動登録の対象外）。除外名はSetか配列の定数にまとめる。
 
-### A-3. Discord逐次表示（src/services/streamReply.js 新規 + src/index.js）
-- 新規モジュール `streamReply.js`: `createStreamReply(channel, { throttleMs = 2500, softLimit = 1900, now })` → `{ update(fullText), finalize(fullText), reset() }` を返す。
-  - `update`: 2.5秒スロットルで「現在のメッセージ」を編集。初回テキスト到着時に最初のメッセージを `channel.send` で作る。表示中は末尾にカーソル `▌` を付ける。
-  - softLimit(1900字)超過時: 段落境界(`\n\n`)優先、なければ改行、なければ強制カットで現在メッセージを確定し、残りを新しいメッセージとして継続。確定済みメッセージは以後編集しない。
-  - `finalize(fullText)`: スロットル無視で最終状態に編集（カーソル除去）。全メッセージ2000字以内保証。テキスト全体が既送分＋現在分と一致するよう分割を完成させる。
-  - `reset()`: 途中までストリームしたがそのstepが回答ではなかった（tool_useで終わった）場合に、作ってしまったメッセージを全削除して初期状態に戻す。
-  - 時刻は `now` 関数を注入可能にしてユニットテスト可能にする（デフォルト `Date.now`）。Discordのedit/sendはawaitし、レートリミット例外はcatchして落ちないこと。
-- index.js MessageCreate側: `onAnswerDelta` で streamReply.update を呼ぶ。runAgent完了後、(a)ストリーム済みなら `finalize(answer)` して chunkMessage 送信はスキップ、(b)一度もdeltaが来ていなければ現行どおり chunkMessage で送る。ステータスメッセージ（⏳/ツールラベル/✅）は現行どおり別メッセージで維持。
-- 複数step間の混線対策: 各stepの累積テキストは0から始まる。stepがtool_useで終わった場合は index.js の `onToolCall` コールバック内（＝ツール実行後に必ず呼ばれる）で `streamReply.reset()` を呼ぶ。最終回答のstepだけがfinalizeに到達する。
-- /research（interaction）経路はストリーミング対象外（現行のdeferReply→editReply運用のまま）。
+### A-2. 設定の取得とキャッシュ（src/services/personaConfig.js 新規）
+- `getPersonaConfig(guild)` (async) をexport:
+  - ギルドから名前が正確に `ai-config` のテキストチャンネルを探す。なければ `null`。
+  - トピック + ピン留めメッセージ（`channel.messages.fetchPinned()`、createdTimestamp昇順、各メッセージの `content`）を結合したテキストを返す。形式: トピックが先、次にピン留め各件。
+  - 合計 **4000字で切り詰め**（超過分は捨てて末尾に `…(省略)` を付ける）。
+  - 空（トピックなし・ピンなし）なら `null`。
+- **インメモリキャッシュ**: guild.idキー、TTL 5分。ピン取得はAPIコールなので毎メッセージ叩かない。
+- `clearPersonaConfigCache(guildId)` もexport。
+- fetchPinned が例外を投げたら（権限不足等）キャッシュにnullを入れてログ1行、落ちないこと。
 
-## 機能B: #ai-memory（自主参照方式）
+### A-3. 即時反映（src/index.js）
+- `Events.ChannelPinsUpdate` と `Events.ChannelUpdate` で、対象チャンネル名が `ai-config`（ChannelUpdateは新旧どちらかの名前が該当）なら `clearPersonaConfigCache(guild.id)` を呼ぶ（TTLを待たず即反映）。
 
-### B-1. ai-memory チャンネルの特例（src/index.js）
-- 現行の「`ai-` で始まるチャンネルをAIチャットチャンネルとして自動登録」処理で、**チャンネル名が正確に `ai-memory` のものだけは登録しない**（= botが会話反応しない）。判定は再利用可能な純関数（例: `isAiChatChannel(name)`）として切り出し、exportしてユニットテスト可能にする。登録箇所は複数ある可能性がある（起動時スキャン・ChannelCreate・GuildCreate等）ので全箇所をこの関数に統一する。
+### A-4. プロンプト注入（src/services/prompt.js + agent.js）
+- `buildSystemPrompt(guild, aiChannelIds, { mode, custom })` に `custom` を追加。`custom` が非空なら、personaの末尾（researchモード追記より前）に以下を追加:
+  ```
+  ## サーバー独自設定（#ai-config より・サーバー管理者が設定）
+  以下はこのサーバーの管理者による指示。上の一般原則と矛盾する場合はこちらを優先する:
+  <custom>
+  ```
+- `agent.js` の `runAgent` 冒頭で `const custom = await getPersonaConfig(guild)` を取り、buildSystemPromptに渡す。guildがnull/フェイクで `channels.cache` が無い場合も落ちないこと。
+- 注意: personaはプロンプトキャッシュ（cache_control）対象。customはTTLキャッシュで安定文字列になるためキャッシュ効率は保たれる。**cache_controlの配置や時刻ブロックの位置は変更禁止。**
+- 地図上で `ai-config` チャンネルには `(ペルソナ設定)` の注記を付ける（ai-memoryの注記と同様の方式）。
 
-### B-2. システムプロンプト（src/services/prompt.js）
-- チャンネル地図の除外は aiChannelIds ベースなので、ai-memory は登録されなくなれば自然に地図に載る。地図上で名前が `ai-memory` のチャンネルには `(あなたの長期記憶)` の注記を付ける。
-- ギルドに `ai-memory` テキストチャンネルが**存在するときだけ**、personaに「## 長期記憶 (#ai-memory)」セクションを追加:
-  - サーバー固有の人物・好み・決定事項・経緯が関わる質問では、まず #ai-memory を read_channel で読む。
-  - ユーザーに「覚えて」と言われたとき、または会話でサーバーに関する持続的な事実（好み・決定・役割）を得たときは、#ai-memory に send_message で保存する。1メッセージ=1事実、簡潔に。
-  - 古くなった記憶は delete_message（自分のメッセージのみ可）で消してから書き直す。
-  - **#ai-memory への send_message と自分のメッセージの delete_message に限り、明示依頼がなくても自律的に使ってよい**（「変更系ツールは明示依頼時のみ」の例外としてプロンプトに明記）。
-- ai-memory チャンネルが存在しないギルドではこのセクションを出さない。
+## 機能B: README.md 全面改訂
 
-### B-3. delete_message ツール（src/services/tools.js）
-- 新ツール `delete_message(channel_id, message_id)`: 対象メッセージをfetchし、**author.id が bot自身のときだけ削除**。他人のメッセージなら `権限エラー: 自分のメッセージ以外は削除できません。` をツール結果として返す（throwしない）。ADMIN_TOOLSには入れない。
-- bot自身のIDは `guild.client.user.id` または `guild.members.me?.id` で取得（executeToolの既存引数を壊さない最小の方法を選ぶ）。
-- toolLabel に delete_message 用ラベルを追加。TOOLSのdescriptionに「自分のメッセージのみ削除可。主に#ai-memoryの記憶更新に使う」旨を書く。
+現行READMEはv1（Router/Planner/Finalizer時代）の内容で古い。v2の実態に合わせて全面的に書き直す（日本語）:
+- **概要**: 単一ループエージェント（1つのsystemプロンプト + モデル自身のツール判断）である旨と特徴
+- **機能一覧**: AIチャットチャンネル（ai-プレフィックス自動認識）、ストリーミング返信（Claude系）、画像読解（Claude系）、#ai-memory 長期記憶、#ai-config ペルソナカスタマイズ、/ai コマンド（status/model/effort/reset）、/research
+- **対応プロバイダー/モデル**: Claude（Max OAuth: fable-5 / opus-4-8 / sonnet-5 / sonnet-4-6 / haiku-4-5）、Gemini、OpenAI、DeepSeek
+- **セットアップ**: 必要な環境変数の表（src/ 内の `process.env.*` 参照と完全一致させること。DISCORD_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, GEMINI_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, AI_PROVIDER, AI_MODEL, CLAUDE_EFFORT, AI_CHANNEL_NAME, ALLOWED_GUILDS/IGNORED_GUILDS 等、実際にコードにあるものを漏れなく）
+- **アーキテクチャ**: src/ 構成（index.js / agent.js / prompt.js / provider.js / tools.js / streamReply.js / personaConfig.js / historyBuilder.js / settings.js / constants.js / attachments.js）の1行説明
+- **デプロイ**: `bash scripts/deploy.sh`（origin/main）、`--rollback`、ブランチ指定。VM上の .env / settings.json はuntrackedで保持される旨
+- **旧アーキテクチャへの言及（router/planner/finalizer/契約書的な古い説明）を一切残さない**
 
-## 機能C（ストレッチ・失敗したら撤退）: thinking要約ステータス
-- Fable 5 のthinking要約表示を**1回だけ**プローブ: `output_config: { thinking: { display: 'summarized' } }` を付けた小リクエスト（fable-5, 短いプロンプト）を試し、400なら別の妥当な形を**最大もう1回だけ**試す。通らなければ**実装せず撤退**し、プローブ結果（送ったパラメータと返ったエラー本文）を報告に書く。
-- 通った場合のみ: ストリーミング中の thinking_delta（要約テキスト）を `onThinkingDelta` としてrunAgent→index.jsに流し、ステータスメッセージを `> 🧠 <要約の末尾80字>` に2.5sスロットルで編集。回答テキストが流れ始めたらステータス更新をやめる。
+## 機能C: package.json のバージョンを 0.4.0 に上げる（v2化の区切り）
 
 ## 禁止事項
-- claudeFetch のOAuthヘッダー・リトライ・Fable5フォールバック挙動の変更禁止（ストリーミング時のアイドルタイムアウト追加を除く）
-- 画像base64方式・thinkingのverbatim保存・cache_control配置（identity→persona(cache)→time、最終メッセージ末尾ブロック）の変更禁止
-- Gemini/OpenAI/DeepSeekセッションの動作変更禁止（onTextDelta無視の追加のみ可）
+- cache_control配置・thinkingのverbatim保存・claudeFetch挙動・streamReply動作の変更禁止
+- Gemini/OpenAI/DeepSeekセッションの動作変更禁止
 - git commit / push / デプロイ禁止（親がやる）
-- reasonix-do / DeepSeek / 外部LLM APIの新規利用禁止（無退行確認のためのdeepseek-chat 1回実行のみ可）
 - 勝手な仕様変更・大規模リファクタ・関係ない変更・長文ログ貼り付け禁止
+- reasonix-do / 外部LLM APIの新規利用禁止
 
 ## 検証（実装者セルフチェック。盲検verifierは別途走る）
-- `find src -name "*.js" | xargs -n1 node --check`
-- 実API（.envのトークン）でストリーミングstepの動作確認。**コスト注意: テストは原則 claude-haiku-4-5-20251001。fable-5 は「ストリーミング下のthinkingリプレイ確認」と機能Cプローブだけに使う**
-- streamReply のユニットテスト（フェイクchannel/message + 注入クロック）
-- isAiChatChannel のユニットテスト
-- 15秒起動スモーク（`Ready! Logged in as` 確認）
+- 全srcファイル `node --check`
+- personaConfig のユニット（フェイクguild/channel/fetchPinned + 注入クロックまたはTTL検証: 2回目の呼び出しでfetchPinnedが再実行されないこと、clearでキャッシュが飛ぶこと、4000字切り詰め、ai-configなし→null、fetchPinned例外→null＋非クラッシュ）
+- buildSystemPrompt のユニット（custom有→セクション出現と優先文言、custom無→出現しない、地図注記）
+- isAiChatChannel('ai-config') → false
+- 実APIは**haiku 1回**の統合確認のみ（ai-configありフェイクguildでrunAgentが落ちず応答が返る）。fable-5使用禁止
+- READMEの環境変数表と `grep -rn "process.env" src/` の突き合わせ
+- 15秒起動スモーク（Ready確認）
 - 一時テストスクリプトはプロジェクト直下に作り、終了後削除
