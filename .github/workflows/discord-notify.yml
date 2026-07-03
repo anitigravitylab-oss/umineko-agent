@@ -1,0 +1,156 @@
+name: Discord Notify
+
+on:
+  push:
+  pull_request:
+    types: [opened, closed]
+  pull_request_review:
+    types: [submitted]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Discord notification
+        uses: actions/github-script@v7
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        with:
+          script: |
+            const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+            if (!webhookUrl) {
+              core.info('DISCORD_WEBHOOK_URL is not set; skipping.');
+              return;
+            }
+
+            const repo = context.repo.owner + '/' + context.repo.repo;
+            function truncate(s, n) {
+              return s.length > n ? s.slice(0, n - 1) + '…' : s;
+            }
+
+            let embed = null;
+
+            if (context.eventName === 'push') {
+              if (context.payload.deleted || context.ref.indexOf('refs/heads/') !== 0) return;
+              const branch = context.ref.replace('refs/heads/', '');
+              const commits = context.payload.commits || [];
+              if (commits.length === 0) return;
+
+              const lines = commits.slice(0, 10).map(function (c) {
+                const short = c.id.substring(0, 7);
+                const msg = truncate(c.message.split('\n')[0], 200);
+                return '[' + short + '](' + c.url + ') ' + msg + ' — ' + c.author.name;
+              });
+              if (commits.length > 10) {
+                lines.push('…ほか' + (commits.length - 10) + '件');
+              }
+
+              embed = {
+                color: 0x2ecc71,
+                title: truncate('📝 ' + repo + ' — ' + branch + ' へ push (' + commits.length + '件)', 256),
+                url: context.payload.compare,
+                description: lines.join('\n').slice(0, 4000),
+              };
+            } else if (context.eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              const action = context.payload.action;
+              const meta = pr.head.ref + ' → ' + pr.base.ref + '  (by ' + pr.user.login + ')';
+
+              if (action === 'opened') {
+                embed = {
+                  color: 0x3498db,
+                  title: truncate('📬 PR作成 #' + pr.number + ': ' + pr.title, 256),
+                  url: pr.html_url,
+                  description: meta,
+                };
+              } else if (action === 'closed' && pr.merged) {
+                embed = {
+                  color: 0x9b59b6,
+                  title: truncate('🔀 マージ #' + pr.number + ': ' + pr.title, 256),
+                  url: pr.html_url,
+                  description: meta,
+                };
+              } else if (action === 'closed' && !pr.merged) {
+                embed = {
+                  color: 0xe74c3c,
+                  title: truncate('❌ PRクローズ(未マージ) #' + pr.number + ': ' + pr.title, 256),
+                  url: pr.html_url,
+                  description: meta,
+                };
+              } else {
+                return;
+              }
+            } else if (context.eventName === 'pull_request_review') {
+              if (context.payload.action !== 'submitted') return;
+              const review = context.payload.review;
+              const pr = context.payload.pull_request;
+              const body = review.body ? '\n' + truncate(review.body, 3800) : '';
+
+              if (review.state === 'approved') {
+                embed = {
+                  color: 0x2ecc71,
+                  title: truncate('✅ レビュー承認 #' + pr.number + ': ' + pr.title, 256),
+                  url: review.html_url,
+                  description: review.user.login + body,
+                };
+              } else if (review.state === 'changes_requested') {
+                embed = {
+                  color: 0xe67e22,
+                  title: truncate('🔧 変更リクエスト #' + pr.number + ': ' + pr.title, 256),
+                  url: review.html_url,
+                  description: review.user.login + body,
+                };
+              } else if (review.state === 'commented' && review.body) {
+                embed = {
+                  color: 0x5dade2,
+                  title: truncate('💬 レビューコメント #' + pr.number + ': ' + pr.title, 256),
+                  url: review.html_url,
+                  description: review.user.login + body,
+                };
+              } else {
+                return;
+              }
+            } else if (context.eventName === 'pull_request_review_comment') {
+              if (context.payload.action !== 'created') return;
+              const comment = context.payload.comment;
+              const pr = context.payload.pull_request;
+              embed = {
+                color: 0x5dade2,
+                title: truncate('💬 コードコメント #' + pr.number + ': ' + pr.title, 256),
+                url: comment.html_url,
+                description: comment.user.login + ' (' + comment.path + ')\n' + truncate(comment.body, 3800),
+              };
+            } else if (context.eventName === 'issue_comment') {
+              if (context.payload.action !== 'created') return;
+              if (!context.payload.issue.pull_request) return;
+              const comment = context.payload.comment;
+              const issue = context.payload.issue;
+              embed = {
+                color: 0x5dade2,
+                title: truncate('💬 PRコメント #' + issue.number + ': ' + issue.title, 256),
+                url: comment.html_url,
+                description: comment.user.login + '\n' + truncate(comment.body, 3800),
+              };
+            } else {
+              return;
+            }
+
+            embed.timestamp = new Date().toISOString();
+            embed.footer = { text: repo };
+
+            await fetch(webhookUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                username: repo,
+                embeds: [embed],
+                allowed_mentions: { parse: [] },
+              }),
+            });
