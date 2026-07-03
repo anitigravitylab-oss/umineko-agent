@@ -1,7 +1,7 @@
 import { TOOLS, executeTool, toolLabel } from './tools.js';
 import { createAgentSession } from './provider.js';
 import { buildSystemPrompt } from './prompt.js';
-import { getPersonaConfig } from './personaConfig.js';
+import { getPersonaConfig, getMemoryDigest } from './personaConfig.js';
 
 const MAX_ITERATIONS = 15;
 
@@ -19,7 +19,8 @@ export async function runAgent({
   maxIterations = MAX_ITERATIONS,
 }) {
   const custom = await getPersonaConfig(guild);
-  const system = buildSystemPrompt(guild, aiChannelIds, { mode, custom });
+  const memoryDigest = await getMemoryDigest(guild);
+  const system = buildSystemPrompt(guild, aiChannelIds, { mode, custom, memoryDigest });
   const session = createAgentSession({
     provider: settings.provider,
     model: settings.model,

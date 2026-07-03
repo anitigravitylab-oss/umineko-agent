@@ -227,6 +227,13 @@ export const TOOLS = WEB_SEARCH_ENABLED ? [...DISCORD_TOOLS, ...WEB_TOOLS_DEFS] 
 
 const WINDOWS_API = `http://${process.env.WINDOWS_API_HOST || 'localhost'}:7654`;
 
+// #ai-config はトピック/ピン留めのみを読む設計（personaConfig.js の
+// getPersonaConfig）で、read_channel による通常メッセージ（下書き・編集
+// 途中の内容を含む）の閲覧は意図しない混入経路になるため明示的に塞ぐ。
+// aiChannelIds ベースの除外だけでは ai-config を塞げない（ai-configは
+// aiChannelIdsに登録されないため）ので、名前による専用チェックを行う。
+const AI_CONFIG_CHANNEL_NAME = 'ai-config';
+
 const ADMIN_TOOLS = new Set([
   'create_channel', 'edit_channel',
   'create_category', 'edit_category',
@@ -252,6 +259,9 @@ export async function executeTool(name, args, guild, aiChannelIds, member) {
 async function executeToolInner(name, args, guild, aiChannelIds) {
   switch (name) {
     case 'read_channel': {
+      if (args.channel_name === AI_CONFIG_CHANNEL_NAME) {
+        return `チャンネル #${args.channel_name} が見つかりませんでした。`;
+      }
       const channel = guild.channels.cache.find(
         (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );
@@ -267,6 +277,12 @@ async function executeToolInner(name, args, guild, aiChannelIds) {
     }
 
     case 'send_message': {
+      // #ai-configへの投稿を許すと、次回のgetPersonaConfigフォールバック
+      // （トピック/ピン留めが空のときだけ直近メッセージを読む機構）がその
+      // 投稿を「設定」として読み込んでしまう自己汚染ループになるため塞ぐ。
+      if (args.channel_name === AI_CONFIG_CHANNEL_NAME) {
+        return `権限エラー: #${args.channel_name}への投稿はできません。設定はチャンネルのトピックまたはピン留めで行ってください。`;
+      }
       const channel = guild.channels.cache.find(
         (c) => c.name === args.channel_name && c.type === ChannelType.GuildText && !aiChannelIds.has(c.id)
       );

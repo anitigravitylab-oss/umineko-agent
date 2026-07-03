@@ -5,7 +5,7 @@ import { runAgent } from './services/agent.js';
 import { buildConversationHistory } from './services/historyBuilder.js';
 import { extractImageUrls } from './services/attachments.js';
 import { createStreamReply } from './services/streamReply.js';
-import { clearPersonaConfigCache } from './services/personaConfig.js';
+import { clearPersonaConfigCache, clearMemoryDigestCache } from './services/personaConfig.js';
 import {
   getGuildSettings,
   updateGuildSettings,
@@ -142,6 +142,7 @@ const AI_CHANNEL_PREFIX = process.env.AI_CHANNEL_PREFIX || 'ai-';
 // （prompt.js / tools.js / personaConfig.js側の対応と対）。
 const AI_SPECIAL_CHANNEL_NAMES = new Set(['ai-memory', 'ai-config']);
 const AI_CONFIG_CHANNEL_NAME = 'ai-config';
+const AI_MEMORY_CHANNEL_NAME = 'ai-memory';
 const aiChannelIds = new Set();
 
 // 純関数（チャンネル名だけを見る）。登録箇所（起動時スキャン・GuildCreate・
@@ -213,6 +214,31 @@ client.on(Events.ChannelUpdate, (oldChannel, newChannel) => {
   // ai-configのまま）のいずれもnewChannel.name判定でカバーされる。
   if (oldChannel.name === AI_CONFIG_CHANNEL_NAME || newChannel.name === AI_CONFIG_CHANNEL_NAME) {
     clearPersonaConfigCache(newChannel.guild.id);
+  }
+});
+
+// #ai-memory への投稿・編集・削除をTTLを待たず即座にダイジェストへ反映する。
+// #ai-config への新規投稿も、トピック/ピン留めが両方空のときのフォールバック
+// 経路（personaConfig.js fetchPersonaConfig）が新規メッセージに反応するため
+// 同様に扱う（トピック/ピン留めの変更自体はChannelPinsUpdate/ChannelUpdateで
+// 既にカバー済み）。投稿者がbot自身かどうかは問わず、対象チャンネルへの
+// あらゆる変更でキャッシュを飛ばす。
+client.on(Events.MessageCreate, (message) => {
+  if (!message.guild) return;
+  const name = message.channel?.name;
+  if (name === AI_MEMORY_CHANNEL_NAME) clearMemoryDigestCache(message.guild.id);
+  else if (name === AI_CONFIG_CHANNEL_NAME) clearPersonaConfigCache(message.guild.id);
+});
+
+client.on(Events.MessageUpdate, (oldMessage, newMessage) => {
+  if (newMessage.guild && newMessage.channel?.name === AI_MEMORY_CHANNEL_NAME) {
+    clearMemoryDigestCache(newMessage.guild.id);
+  }
+});
+
+client.on(Events.MessageDelete, (message) => {
+  if (message.guild && message.channel?.name === AI_MEMORY_CHANNEL_NAME) {
+    clearMemoryDigestCache(message.guild.id);
   }
 });
 

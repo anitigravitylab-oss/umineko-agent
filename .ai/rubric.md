@@ -1,44 +1,58 @@
-# 合格基準（rubric）— Phase 3: #ai-config ペルソナカスタマイズ + README改訂
+# 合格基準（rubric）— Phase 4: #ai-memory自動埋め込み + #ai-config read_channel遮断
 
-実装の経緯は見ずに、現在のコード（mainとの差分）と実際の動作だけで機械的に照合すること。曖昧な場合は不合格側に倒す。一時スクリプトはプロジェクト直下に作成し実行後削除。LLM APIのモック禁止（Discordのguild/channel/message/pinはフェイク可）。コスト厳守: 実APIは `claude-haiku-4-5-20251001` を1〜2回まで。`claude-fable-5` 使用禁止。
+実装の経緯は見ずに、現在のコード（mainとの差分）と実際の動作だけで機械的に照合すること。曖昧な場合は不合格側に倒す。一時スクリプトはプロジェクト直下に作成し実行後削除。LLM APIのモック禁止（Discordのguild/channel/message/fetchのフェイクは可）。コスト厳守: 実APIは `claude-haiku-4-5-20251001` を1〜2回まで。`claude-fable-5`/`claude-opus-4-8` 使用禁止。
 
 ## 1. 構成
-- [ ] `src/services/personaConfig.js` が存在し、`getPersonaConfig` / `clearPersonaConfigCache` をexport
-- [ ] `isAiChatChannel('ai-config')` → false、`isAiChatChannel('ai-chat')` → true、`isAiChatChannel('ai-memory')` → false
-- [ ] `package.json` の version が `0.4.0`
+- [ ] `src/services/personaConfig.js` が `getMemoryDigest` / `clearMemoryDigestCache` をexport（既存の `getPersonaConfig` / `clearPersonaConfigCache` は変更なし）
 - [ ] 全srcファイルが `node --check` を通る
 - [ ] `timeout 17 node src/index.js` で `Ready! Logged in as umineko-agent#3789`、起動エラーなし
 
-## 2. personaConfig（ユニット・フェイクguild）
-- [ ] ai-config チャンネルあり（topic + ピン2件）→ 戻り値にtopicと両ピンの内容が含まれ、ピンはcreatedTimestamp昇順
-- [ ] ai-config チャンネルなし → null。topicもピンも空 → null
-- [ ] 合計4000字超 → 4000字程度で切り詰められ省略マーカーが付く
-- [ ] TTLキャッシュ: 同一guildで2回目の呼び出しでは fetchPinned が再実行されない（呼び出し回数を記録するフェイクで確認）。`clearPersonaConfigCache(guildId)` 後は再実行される
-- [ ] fetchPinned が例外を投げても throw せず null（または空）を返す
+## 2. getMemoryDigest（ユニット・フェイクguild）
+- [ ] `ai-memory` チャンネルに複数メッセージあり → 整形された文字列が返り、各メッセージの発言者名と内容が含まれる、古い順
+- [ ] `ai-memory` チャンネルなし → null
+- [ ] `ai-memory` チャンネルはあるがメッセージ0件（または空文字content only）→ null
+- [ ] 合計4000字超 → 切り詰められ省略マーカーが付く
+- [ ] TTLキャッシュ: 同一guildで2回目の呼び出しでは `messages.fetch` が再実行されない（呼び出し回数を記録するフェイクで確認）。`clearMemoryDigestCache(guildId)` 後は再実行される
+- [ ] fetch失敗時にthrowせずnullを返す（非クラッシュ）
 
-## 3. プロンプト注入
-- [ ] `buildSystemPrompt(guild, aiChannelIds, {custom: '...'})` → personaに「サーバー独自設定」相当のセクションが出現し、管理者設定を優先する旨の文言とcustom本文を含む
-- [ ] custom なし（null/undefined/空文字）→ セクションが出現しない
-- [ ] researchモード併用時、research追記もサーバー独自設定も両方含まれる
-- [ ] 地図上で `ai-config` チャンネルに注記（ペルソナ設定である旨）が付く
-- [ ] `agent.js` の runAgent が getPersonaConfig を呼び buildSystemPrompt に渡している（コードレビュー）。channels.cache が**空**（存在はする）のフェイクguildでも runAgent が落ちない。`getPersonaConfig` 単体は guild が null / channels.cache 欠如でも throw しない（channels.cache を完全に持たないguildでの runAgent 全体は実運用に存在しないため対象外）
-- [ ] **キャッシュ配置の無退行**: リクエストのsystem配列が従来どおり identity → persona(cache_control) → time の順（コードレビューまたはfetchフック）
+## 3. buildSystemPrompt への統合
+- [ ] `memoryDigest` に非空文字列を渡す → persona内の長期記憶セクションにその内容がそのまま含まれる
+- [ ] `memoryDigest` がnull/undefined/空文字 → 長期記憶セクション内に自動埋め込み部分の文言が出ない（ただしai-memoryチャンネル自体が存在する場合はread_channelを促す文言は残る）
+- [ ] `ai-memory` チャンネル自体が存在しない場合 → 長期記憶セクション自体が出ない（既存動作の無退行）
+- [ ] `custom`（#ai-config由来）と`memoryDigest`を同時に渡した場合、両方ともpersonaに含まれる
+- [ ] 地図上の `(あなたの長期記憶)` `(ペルソナ設定)` 注記は既存どおり変化なし
+- [ ] **キャッシュ配置の無退行**: system配列が identity → persona(cache_control) → time の順（コードレビューまたはfetchフック）
 
-## 4. 即時反映（コードレビュー）
-- [ ] index.js に ChannelPinsUpdate / ChannelUpdate のリスナーがあり、ai-config チャンネルの変更で clearPersonaConfigCache が呼ばれる（ChannelUpdateは改名で ai-config になった/でなくなった両方向をカバー）
+## 4. agent.js統合
+- [ ] `runAgent` が `getMemoryDigest(guild)` を呼び `buildSystemPrompt` に渡している（コードレビュー）
+- [ ] `channels.cache` が空のフェイクguildでも `runAgent` が落ちない
 
-## 5. README.md
-- [ ] Router / Planner / Finalizer / 旧ファイル名（router.js, planner.js, finalizer.js, llm.js, research.js, contextBuilder.js, channelSelector.js, deepseek.js）への言及が本文にない（アーキテクチャ説明が単一ループとして書かれている）
-- [ ] 環境変数の表があり、`grep -rhoP "process\.env\.[A-Z_]+" src/ | sort -u` の結果と過不足なく対応する（コード側にあってREADMEにない変数、READMEにあってコードにない変数がいずれもゼロ）
-- [ ] 機能説明に以下が全部ある: ai-プレフィックス自動認識 / ストリーミング返信(Claude系) / 画像読解(Claude系) / #ai-memory / #ai-config / /ai サブコマンド4種(status/model/effort/reset) / /research
-- [ ] 対応モデルの記載が constants.js / index.js の choices と矛盾しない
-- [ ] デプロイ節に scripts/deploy.sh と --rollback の説明がある
+## 5. read_channelの#ai-config遮断
+- [ ] `executeTool('read_channel', {channel_name: 'ai-config'}, ...)` → 実際のチャンネル内容ではなく「見つかりませんでした」相当のエラーテキストが返る（実際に`ai-config`チャンネルがフェイクguildに存在し、かつ中にメッセージがあってもその内容が漏れないことを確認）
+- [ ] `executeTool('read_channel', {channel_name: 'ai-memory'}, ...)` → 引き続き正常にメッセージ内容が読める（無退行）
+- [ ] `executeTool('read_channel', {channel_name: '<通常チャンネル>'}, ...)` → 引き続き正常に読める（無退行）
+- [ ] `aiChannelIds` に登録された通常のAIチャットチャンネル名でも、既存どおり読めない（無退行、既存フィルタ条件が壊れていない）
 
-## 6. 実API統合（haiku 1回）
-- [ ] ai-config ありのフェイクguild（topicに一意な口調指示、例:「語尾に『にゃ』を付ける」）で runAgent 雑談 → 応答が返り、口調指示が反映される（反映は緩め判定: 応答に指示痕跡があれば合格、なければsystemプロンプト送信内容に指示が入っていることをfetchフックで確認して合格）
+## 5b. #ai-configのメッセージフォールバック（2026-07-03追加）
+- [ ] トピックなし・ピンなし・#ai-configにメッセージあり → そのメッセージ内容がgetPersonaConfigの戻り値としてフォールバックで返る
+- [ ] トピックまたはピンが1件でもある → メッセージフォールバックは使われない（直近メッセージの内容が戻り値に混ざらない）
+- [ ] トピックなし・ピンなし・メッセージもなし → null
+- [ ] `executeTool('send_message', {channel_name: 'ai-config', content: '...'}, ...)` → 実際には送信されず権限エラー相当のテキストが返る
 
-## 7. 無退行
-- [ ] chunkMessage / streamReply / isAiChatChannel の既存ユニット相当が引き続き成立（streamReplyは初回send+スロットル+リトライ再描画の3点だけで可）
+## 5c. send_messageの#ai-config遮断（自己汚染防止・2026-07-03追加）
+- [ ] `executeTool('send_message', {channel_name: 'ai-config', content: '...'}, ...)` → 実際には送信されず権限エラー相当のテキストが返る
+- [ ] `executeTool('send_message', {channel_name: '<通常チャンネル>', content: '...'}, ...)` → 引き続き正常に送信される（無退行）
 
-## 8. 総合判定
+## 6. 即時反映（コードレビュー）
+- [ ] index.js に `#ai-memory` チャンネルへの MessageCreate（少なくとも）のリスナーがあり、`clearMemoryDigestCache` を呼んでいる
+- [ ] index.js に `#ai-config` チャンネルへの MessageCreate のリスナーがあり、`clearPersonaConfigCache` を呼んでいる（フォールバック経路のため新規追加）
+
+## 7. 実API統合（haiku 1回）
+- [ ] `ai-memory` に一意な内容（例:「合言葉はパイナップル」）を仕込んだフェイクguildで `runAgent` 雑談（read_channelを誘発しない質問）→ fetchフックで送信された最初のsystemプロンプトの中に、read_channelを呼ぶ前から既にその内容が含まれていることを確認する
+
+## 8. 無退行
+- [ ] send_message / delete_message ツールの `#ai-memory` 向け動作（自律使用可、bot自身のメッセージのみ削除可）に変化なし
+- [ ] `#ai-config` のトピック/ピン留め自動反映機構（`getPersonaConfig`）自体は無変更・無退行
+
+## 9. 総合判定
 全項目合格なら `.ai/verifier-report.md` に合格と各項目の根拠を記録（上書き）。不合格項目は具体的な失敗内容を明記。

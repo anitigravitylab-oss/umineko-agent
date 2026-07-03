@@ -7,7 +7,7 @@ import { ChannelType } from 'discord.js';
 const AI_MEMORY_CHANNEL_NAME = 'ai-memory';
 const AI_CONFIG_CHANNEL_NAME = 'ai-config';
 
-export function buildSystemPrompt(guild, aiChannelIds, { mode, custom } = {}) {
+export function buildSystemPrompt(guild, aiChannelIds, { mode, custom, memoryDigest } = {}) {
   const channelList = guild.channels.cache
     .filter((c) => c.type === ChannelType.GuildText && !aiChannelIds.has(c.id))
     .map((c) => {
@@ -50,10 +50,16 @@ ${channelList || '(なし)'}
 - 会話履歴のユーザー発言には「名前: 」プレフィックスが付いているが、これは表示上の属性。自分の発言には付けない`;
 
   if (hasMemoryChannel) {
+    const digest = memoryDigest && memoryDigest.trim();
+    // digestが空（チャンネルはあるがメッセージ0件）の場合は自動埋め込み部分を
+    // 出さず、従来どおりread_channelでの取得を促す文言のみにする。
+    const intro = digest
+      ? `以下は#ai-memoryに書かれている内容（自動反映・毎回最新）:\n${digest}\n\n- 上記に無い、サーバー固有の人物・好み・決定事項・経緯が関わる質問では、より詳しい履歴を read_channel で読む。`
+      : `- サーバー固有の人物・好み・決定事項・経緯が関わる質問では、まず #ai-memory を read_channel で読む。`;
     persona += `
 
 ## 長期記憶 (#ai-memory)
-- サーバー固有の人物・好み・決定事項・経緯が関わる質問では、まず #ai-memory を read_channel で読む。
+${intro}
 - ユーザーに「覚えて」と言われたとき、または会話でサーバーに関する持続的な事実（好み・決定・役割）を得たときは、#ai-memory に send_message で保存する。1メッセージ=1事実、簡潔に。
 - 古くなった記憶は delete_message（自分のメッセージのみ可）で消してから書き直す。
 - #ai-memory への send_message と自分のメッセージの delete_message に限り、「変更系ツールは明示依頼時のみ」の例外として、明示依頼がなくても自律的に使ってよい。`;
