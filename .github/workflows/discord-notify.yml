@@ -91,7 +91,7 @@ jobs:
               if (context.payload.action !== 'submitted') return;
               const review = context.payload.review;
               const pr = context.payload.pull_request;
-              const body = review.body ? '\n' + truncate(review.body, 500) : '';
+              const body = review.body ? '\n' + truncate(review.body, 3800) : '';
 
               if (review.state === 'approved') {
                 embed = {
@@ -125,7 +125,7 @@ jobs:
                 color: 0x5dade2,
                 title: truncate('💬 コードコメント #' + pr.number + ': ' + pr.title, 256),
                 url: comment.html_url,
-                description: comment.user.login + ' (' + comment.path + ')\n' + truncate(comment.body, 500),
+                description: comment.user.login + ' (' + comment.path + ')\n' + truncate(comment.body, 3800),
               };
             } else if (context.eventName === 'issue_comment') {
               if (context.payload.action !== 'created') return;
@@ -136,7 +136,7 @@ jobs:
                 color: 0x5dade2,
                 title: truncate('💬 PRコメント #' + issue.number + ': ' + issue.title, 256),
                 url: comment.html_url,
-                description: comment.user.login + '\n' + truncate(comment.body, 500),
+                description: comment.user.login + '\n' + truncate(comment.body, 3800),
               };
             } else {
               return;
